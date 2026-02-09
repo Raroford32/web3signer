@@ -12,6 +12,85 @@ This is not about one endpoint or one missing check. It's about how three indivi
 
 ---
 
+## Gap 0: How the Attacker Reaches Web3Signer
+
+Web3Signer is an internal service — not meant to be internet-facing. The attacker must first get TCP connectivity to port 9000. This is the hardest part of the chain and the most overlooked.
+
+### The Official Docker Image Ships Bound to 0.0.0.0
+
+`docker/Dockerfile:32-33`:
+```dockerfile
+ENV WEB3SIGNER_HTTP_LISTEN_HOST="0.0.0.0" \
+    WEB3SIGNER_METRICS_HOST="0.0.0.0"
+```
+
+The Java code defaults to `localhost`. But the **official Docker image overrides this to `0.0.0.0`** via environment variable. Every container deployment using the official image already listens on all interfaces. This is not operator misconfiguration — it's the shipped default. The operator would have to actively override it back to `127.0.0.1`, which breaks container networking (the port wouldn't be reachable from outside the container, defeating the purpose of running it in Docker/k8s).
+
+This means the question isn't "is it bound to 0.0.0.0?" — it almost certainly is. The question is: **can anyone route a packet to it?**
+
+### Realistic Attack Vectors to Reach Port 9000
+
+**Vector 1: Kubernetes / cloud networking misconfiguration (most common)**
+
+The typical staking stack in k8s is:
+```
+[beacon node] → [web3signer:9000] → [vault / keystores]
+                      ↓
+              [postgresql:5432] (slashing protection)
+```
+
+All pods in the same namespace can reach each other by default — k8s has no network isolation unless someone explicitly creates a `NetworkPolicy`. Most operators don't. If the attacker compromises ANY pod in the same namespace (or cluster, if no namespace isolation exists), they can reach web3signer:9000 directly. That "any pod" could be:
+- A monitoring agent (Prometheus exporters, Datadog, etc.)
+- A log shipper (Fluentd, Filebeat)
+- A webhook handler
+- A CI/CD runner
+- Any sidecar container
+
+Additionally, common misconfigurations that expose 9000 directly to the internet:
+- `Service type: LoadBalancer` instead of `ClusterIP`
+- `NodePort` service on all cluster nodes
+- Ingress controller with a wildcard route
+- Cloud security group allowing 9000 from 0.0.0.0/0
+
+**Vector 2: SSRF from an adjacent service**
+
+The attacker doesn't need to reach Web3Signer directly. They need to reach any service that CAN reach Web3Signer. The monitoring stack is the most common entry point:
+
+- **Grafana** (known SSRF vulnerabilities: CVE-2020-13379, etc.) — if the operator's Grafana can reach Web3Signer's network, an SSRF through Grafana becomes a signing oracle
+- **Prometheus** — if Prometheus is configured to scrape Web3Signer metrics (port 9001, also bound to 0.0.0.0 per the Dockerfile), the attacker knows the internal IP/hostname from the Prometheus targets page
+- **Beacon node REST API** — beacon nodes expose REST APIs and have larger attack surfaces due to p2p networking; if the beacon node is compromised, it sits right next to Web3Signer on the network
+- **Any webhook/notification endpoint** in the staking stack that processes external input
+
+The attack: find SSRF in Grafana/monitoring → send requests to `http://web3signer:9000/api/v1/eth2/sign/...` through the SSRF → get signatures back.
+
+**Vector 3: Metrics endpoint leaks the target (port 9001)**
+
+Web3Signer's metrics port (9001, also bound to `0.0.0.0`) is often scraped by external monitoring. The metrics themselves are not sensitive, so operators often leave them more accessible. But the metrics response confirms the service exists, and the Prometheus target config reveals the internal hostname/IP of the signing service. Even if 9001 is reachable but 9000 isn't, the attacker now knows exactly where to aim an SSRF.
+
+**Vector 4: Lateral movement from beacon node p2p**
+
+The beacon node has a large attack surface: it participates in a p2p network, receives blocks and attestations from untrusted peers, and parses complex SSZ-encoded data. A vulnerability in the beacon node (memory corruption in SSZ parsing, malicious peer protocol handling) gives the attacker code execution on the beacon node host — which sits directly adjacent to Web3Signer on the internal network.
+
+**Vector 5: Cloud VPC / shared network**
+
+In cloud deployments (AWS, GCP, Azure), staking infrastructure often runs in a VPC alongside other workloads. The attacker compromises any other workload in the VPC (a public-facing web app, an API server, a bastion host with weak credentials). From there, they can route to Web3Signer's internal IP on port 9000. VPC security groups frequently allow all internal traffic.
+
+**Vector 6: Supply chain — malicious dependency or image**
+
+A compromised NPM/Maven/Docker dependency in ANY component of the staking stack (not just Web3Signer itself) can include code that reaches out to Web3Signer on the internal network. The malicious code runs inside the network perimeter, has direct access to internal DNS, and can resolve `web3signer` to its cluster IP.
+
+### The Attacker's Recon Sequence
+
+1. **Scan public infrastructure** — Shodan/Censys for port 9000 with `/upcheck` response. Also scan for Grafana (3000), Prometheus (9090), beacon nodes (5052) which reveal the staking stack exists.
+
+2. **Pivot from accessible component** — Find the weakest link in the stack. Grafana dashboards, beacon node APIs, and monitoring endpoints are typically more exposed than the signer itself.
+
+3. **Discover internal topology** — From the compromised component, resolve internal DNS (`web3signer`, `web3signer.staking.svc.cluster.local`), read Prometheus target configs, or scan the local /16 for port 9000.
+
+4. **Confirm signing oracle** — One HTTP request: `curl -H "Host: localhost" http://<internal-ip>:9000/upcheck` → "OK". The chain begins.
+
+---
+
 ## The Three Gaps
 
 ### Gap 1: Host Header Is the Only Gate, and It's Client-Controlled
